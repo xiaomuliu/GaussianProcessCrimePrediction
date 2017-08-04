@@ -1,0 +1,262 @@
+---
+title: "Areal Spatio-Temporal Kriging"
+date: "May 7, 2015"
+output: html_document
+---
+
+```{r load-data,echo=FALSE, cache=TRUE}
+setwd("/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/CrimeDataSTAnalysis/")
+source("importCrimeData.R")
+filePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/CPD_DWH/"
+fileName <- "X_VIOLENTCRIME_POINTS_01_14.csv"
+CrimeData <- importCrimeData(filePath,fileName)
+```
+
+In this part we generalize the 2D (space-only) Kriging work to 3D (space-time) Kriging. Note: for this analysis, the mismatch issue between the polygon shape file and the tabular data was resolved by removing all the mismatched records.
+
+```{r conn-mat, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+library(rgdal)
+shapefilePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/CPDShapeFiles/"
+beat.rg <- readOGR(shapefilePath, "beat_bndy")
+
+# centroids 
+Crd.beat <- coordinates(beat.rg)
+```
+
+```{r aggregation, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+## **************** Create spatial polygon data frame *****************
+# aggregated by "beat"
+CrimeData.beat_day <- aggregate(INC_CNT~BEAT+DATEOCC+YEAR+MONTH+DOW,data=CrimeData, FUN=sum, na.rm=TRUE)
+CrimeData.beat_day <- CrimeData.beat_day[order(CrimeData.beat_day$DATEOCC),]
+CrimeData.beat_day$DOW <- factor(CrimeData.beat_day$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+CrimeData.beat_month <- aggregate(INC_CNT~BEAT+MONTH,data=CrimeData, FUN=sum, na.rm=TRUE)
+CrimeData.beat_year <- aggregate(INC_CNT~BEAT+YEAR, data=CrimeData, FUN=sum, na.rm=TRUE)
+CrimeData.beat_all <- aggregate(INC_CNT~BEAT,data=CrimeData, FUN=sum, na.rm=TRUE)
+
+# NOTE: there are a few mismatches between beat number in shape files and those in crime data
+
+# create a spatial polygon data frame template
+beat_template.spdf <- beat.rg
+beat_template.spdf@data$BEAT_NUMBE<- as.factor(as.integer(as.character(beat_template.spdf@data$BEAT_NUMBE)))
+beat_template.spdf@data$INC_CNT <- rep(NA,nrow(beat_template.spdf@data))
+
+## *************** Create Spatio-Temporal irregular layout data ******************
+library(spacetime)
+
+# Currently resolve the mismatch issue by removing all the mismatched records 
+bNo1 <- as.numeric(sort(as.character(unique(beat.rg@data$BEAT_NUMBE))))
+bNo2 <- as.numeric(as.character(unique(CrimeData.beat_all$BEAT)))
+miss <- numeric()
+for (i in bNo2){
+  if (length(which(bNo1==i)) == 0){
+    miss <- c(miss,i)
+  }
+}
+
+rm_idx <- numeric()
+for (i in miss){
+  k = which(as.numeric(as.character(CrimeData.beat_day$BEAT)) == i)
+  rm_idx = c(rm_idx,k)
+}
+CrimeData.beat_day<-CrimeData.beat_day[-rm_idx,]
+CrimeData.beat_day$BEAT <- as.factor(CrimeData.beat_day$BEAT)
+
+CrimeData.beat_day$BEAT <- factor(as.character(CrimeData.beat_day$BEAT),levels=levels(beat_template.spdf@data$BEAT_NUMBE))
+
+beat.loc <- data.frame(BEAT=beat_template.spdf@data$BEAT_NUMBE, X_COORD=Crd.beat[,1], Y_COORD=Crd.beat[,2])
+beat.loc <- beat.loc[match(CrimeData.beat_day$BEAT,beat.loc$BEAT),]
+
+beatCentroids <- coordinates(beat.loc[,c("X_COORD","Y_COORD")])
+rownames(beatCentroids) <- beat.loc$BEAT
+beatCentroids <- SpatialPoints(beatCentroids,CRS(proj4string(beat_template.spdf)))
+
+CrimeData_beat_day.stfdf <- stConstruct(subset(CrimeData.beat_day,select=c("BEAT","DATEOCC","INC_CNT")),space="BEAT",
+                                 SpatialObj=beatCentroids, time="DATEOCC")
+CrimeData_beat_day.stfdf <- as(CrimeData_beat_day.stfdf,"STFDF") 
+
+```
+
+Before plotting the spatio-temporal variograms, we first look at the autocorrelation function (ACF) of the time series only. Due to the large number of beats, here we only display district-wise ACFs. Note: district 31 does not have adequate data to calculate ACF. The purpose of doing this is to explore if time serie autocorrelations vary according to their locations. Even de-trending process has not been done, we see that the the daily crime counts in a few districts (1, 13, 20, 21) are not very correlated in terms of time. 
+
+```{r acf, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=8, fig.height=6, cache=TRUE}
+## ***************** Temporal autocorrelation *************
+# plot ACF of each district
+CrimeData.district <- aggregate(INC_CNT~DISTRICT+DATEOCC+YEAR+MONTH+DOW,data=CrimeData, FUN=sum, na.rm=TRUE)
+
+# par(mfrow=c(4,3),oma=c(0,0,2,0))
+par(mfrow=c(4,3))
+for (i in unique(CrimeData.district$DISTRICT)){
+  if (i== 31) next #district 31 does not have adequate data
+  par(mar=c(4,4,3,1.5))
+  acf(na.omit(subset(CrimeData.district,DISTRICT==i,select="INC_CNT")), main = i,lwd=1.5)
+}
+# title(main=list("Autocorrelation for each district (2008-2014)", cex=1.25),outer=TRUE)
+
+```
+
+For the following analysis, we will be focusing only on beats. Now combining with the spatial covariance information, we plot the city-wide spatio-temporal variogram. For computational reasons, here we only pooled over data of 08/01/2013-07/31/2014 and considered time lag up to 14 days. The spatio-temporal variogram can be viewed in different ways. Two 2D plots and a 3D plot are shown in the following three figures.
+
+```{r stVgm-sample, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE,eval=TRUE}
+## ********************* spatio-temporal variograms *************************
+library(gstat)
+timeslot <- "2013-08-01::2014-07-31"
+ptm <- proc.time()
+stVgm <- variogramST(INC_CNT~1,CrimeData_beat_day.stfdf[,timeslot,"INC_CNT"],tlags=0:14,progress=F)
+proc.time() - ptm
+
+# eps = 1e-6
+# CrimeData_beat_day.stfdf@data$logINC_CNT <- log(CrimeData_beat_day.stfdf@data$INC_CNT+eps)
+# ptm <- proc.time()
+# stVgm <- variogramST(logINC_CNT~1,CrimeData_beat_day.stfdf[,"2014-09-01::2014-10-31","logINC_CNT"],tlags=0:14,progress=F)
+# proc.time() - ptm
+
+# # reduce spatial separation distance up to which point pairs are included in semivariance estimates
+# ptm <- proc.time()
+# stVgm <- variogramST(INC_CNT~1,CrimeData_beat_day.stfdf[,"2014-01-01::2014-12-31","INC_CNT"],cutoff=2e4,tlags=0:14,progress=F)
+# proc.time() - ptm
+
+f1 <- plot(stVgm,colorkey=list(width=0.75))
+f2 <- plot(stVgm,map=FALSE)
+# print(f1, position=c(0, 0, 0.5, 1), more=TRUE)
+# print(f2, position=c(0.5, 0, 1, 1))
+print(f1)
+print(f2)
+
+f3 <- plot(stVgm, wireframe=T,zlab=NULL,xlab=list("distance", rot=30), ylab=list("time lag", rot=-35),
+     scales=list(arrows=F,z=list(distance=5)), col.regions=bpy.colors(),colorkey=list(width=0.75))
+print(f3)
+```
+
+Here we are trying out three spatio-temporal variogram models for fitting sample S-T variograms: 
+
+the metric model:
+$$
+C_{st}(h_s,h_t) = C(a^2|h_s|^2+b^2h_t^2)
+$$
+the separable (product) model: 
+$$
+C_{st}(h_s,h_t) = C_s(h_s)C_t(h_t)
+$$
+the product-sum model:
+$$
+C_{st}(h_s,h_t) = k_1C_s(h_s)C_t(h_t)+k_2C_s(h_s)+k_3C_t(h_t)
+$$
+Utilizing the relation $\gamma(h)=C(0)-C(h)$, we can write these covariance expressions in terms of variogram, for example,
+
+the separable model:
+$$
+\gamma_{st}(h_s,h_t) = C_t(0)\gamma_s(h_s)+C_s(0)\gamma_t(h_t)-\gamma_s(h_s)\gamma_t(h_t)
+$$
+the product-sum model:
+$$
+\gamma_{st}(h_s,h_t) = [k_2+k_1C_t(0)]\gamma_s(h_s)+[k_3+k_1C_s(0)]\gamma_t(h_t)-k_1\gamma_s(h_s)\gamma_t(h_t)
+$$
+
+For the metric model, we set the spatio-temporal ratio which is defined as the number of space units equivalent to one time unit to be 2500, that is the variogram values of two samples with distance 2500 in space is equivalent to those with time diffence of one day.
+
+```{r stVgm-fit, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE, eval=TRUE}
+NumBeat <- length(unique(beat_template.spdf@data$BEAT))
+stRatio <- 2500
+methods = c("metric","separable","productSum")
+
+vgm1 <- vgmST(methods[1],joint=vgm(psill=1,"Sph",range=6000, nugget=0.1),stAni=stRatio)
+vgm1.fit <- fit.StVariogram(stVgm,vgm1)
+# attr(vgm1.fit,"optim")$value #rmse
+
+vgm2 <- vgmST(methods[2],space=vgm(psill=1,"Sph",range=6000, nugget=0.2),time=vgm(psill=0.3,"Sph",range=14,nugget=0.1), sill=1.2)
+vgm2.fit <- fit.StVariogram(stVgm,vgm2,method="L-BFGS-B")
+# attr(vgm2.fit,"optim")$value #rmse
+
+vgm3 <- vgmST(methods[3],space=vgm(psill=1,"Sph",range=6000, nugget=0.2),time=vgm(psill=0.3,"Sph",range=14,nugget=0.1), sill=1.2, nugget=0.1)
+vgm3.fit <- fit.StVariogram(stVgm,vgm3,method="L-BFGS-B")
+# attr(vgm3.fit,"optim")$value #rmse
+
+plot(stVgm, list(vgm1.fit,vgm2.fit,vgm3.fit), colorkey=list(width=0.75))
+
+library(lattice)
+# plot(stVgm,vgm1.fit,all=T,wireframe=T,zlab=NULL,xlab=list("distance", rot=30), ylab=list("time lag", rot=-35),
+#      scales=list(arrows=F,z=list(distance=5)))
+# 
+# plot(stVgm,vgm2.fit,all=T,wireframe=T,zlab=NULL,xlab=list("distance", rot=30), ylab=list("time lag", rot=-35),
+#      scales=list(arrows=F,z=list(distance=5)))
+
+plot(stVgm,list(vgm1.fit,vgm2.fit,vgm3.fit), all=T, wireframe=T, zlab=NULL, xlab=list("distance", rot=30), 
+     ylab=list("time lag", rot=-35),scales=list(arrows=F,z=list(distance=5)), colorkey=list(width=0.75))
+
+```
+
+Now we would like to predict next two day's violent crime distribution. The spatial interpolation was done over a $100 \times 100$ regular grid within the city border. Again, local 200 neigboring observations were used for computational concerns. To be more precisely, the variogram model was estimated globally while solving the linear system equations only take the local observations into account to calucate distances in kernels. We pick the product-sum model which yields the Kriging prediction shown as follows.
+
+```{r STkrige, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE, eval=TRUE}
+## ************************* Kriging ********************************
+## set up prediction grid
+
+# temporal forecast grid
+library(xts)
+pred.ndays <- 2
+# grd.t <- xts(1:pred.ndays,order.by=seq(max(index(CrimeData_beat_day.stfdf))+1,max(index(CrimeData_beat_day.stfdf))+pred.ndays,length=pred.ndays))
+grd.t <- xts(1:pred.ndays,order.by=seq(max(index(CrimeData_beat_day.stfdf[,timeslot]))+1,
+                                       max(index(CrimeData_beat_day.stfdf[,timeslot]))+pred.ndays,length=pred.ndays))
+
+# spatial interpolation grid
+cellsizeX = 377
+cellsizeY = 467
+interpx = 100
+interpy = 100
+
+grd.s <- spsample(beat.rg, n = interpx*interpy, type="regular")
+# grd.s <- spsample(beat.rg, cellsize=c(cellsizeX,cellsizeY),type="regular",offset = c(0.5,0.5))
+dimnames(grd.s@coords)[[2]]<-c("X_COORD","Y_COORD")
+dimnames(grd.s@bbox)[[1]]<-c("X_COORD","Y_COORD")
+grd.s <- SpatialPixels(grd.s)
+
+# match grid projection
+# grd.s <- spTransform(grd.s, CRS("+proj=utm +zone=16 +datum=WGS84"))
+# CrimeData_beat_day.stfdf <- spTransform(CrimeData_beat_day.stfdf, CRS(proj4string(grd.s)))
+
+# spatio-temporal grid
+grd.st <- STF(grd.s,grd.t)
+
+# space complexity prohibited (matrix inversion: O(n^2), n ~= 287*t)
+# ptm <- proc.time()
+# pred <- krigeST(INC_CNT~1, CrimeData_beat_day.stfdf[,"2014-12-01::2014-12-31","INC_CNT"], grd.st, vgm1)
+# proc.time() - ptm
+# # pred.stfdf <- STFDF(grd, tgrd, data.frame(INC_CNT = pred))
+# pred.stfdf <- pred
+
+# local kriging
+ptm <- proc.time()
+attr(vgm3, "temporal unit") <- "days"
+predST <- krigeST(INC_CNT~1, data=CrimeData_beat_day.stfdf[,timeslot,"INC_CNT"], newdata=grd.st, 
+                modelList=vgm3.fit, nmax=200, stAni=stRatio, computeVar=FALSE, progress=FALSE)
+proc.time() - ptm
+
+# library(RColorBrewer)
+# stplot(predST, col.regions=topo.colors(256), mode="xt")
+
+library(lattice)
+INC.krigedST <- as.data.frame(predST)
+INC.krigedST$endTime <- NULL
+INC.krigedST$sp.ID <- NULL
+INC.krigedST$V1 <- NULL
+names(INC.krigedST)[1:ncol(INC.krigedST)] <- c("X_COORD","Y_COORD","DATEOCC","Pred")
+
+levelplot(Pred~X_COORD+Y_COORD|DATEOCC, data=INC.krigedST,col.regions=topo.colors(256),
+          xlab="X Coordinate",ylab="Y Coordinate",main="Kriging Prediction",colorkey=list(width=0.75))
+
+# krigeST has not implemented the code of computing variance for krigeST.local
+# levelplot(sqrt(Var)~X_COORD+Y_COORD|DATEOCC, data=INC.krigedST,col.regions=topo.colors(256),
+#           xlab="X Coordinate",ylab="Y Coordinate",main="Prediction Standard Error",colorkey=list(width=0.75))
+```
+
+The value differences between these two day predictions.
+```{r PredDiff, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=5, fig.height=5, cache=TRUE,eval=TRUE}
+t1 <- subset(INC.krigedST,DATEOCC==as.Date("2014-08-01"),select=c("X_COORD","Y_COORD","Pred"))
+t2 <- subset(INC.krigedST,DATEOCC==as.Date("2014-08-02"),select=c("X_COORD","Y_COORD","Pred"))
+dif <- data.frame(X_COORD = t1$X_COORD,Y_COORD = t1$Y_COORD,PredDiff<-(t2$Pred-t1$Pred))
+# sum(abs(dif$PredDiff))
+levelplot(PredDiff~X_COORD+Y_COORD, data=dif,col.regions=topo.colors(256),
+          xlab="X Coordinate",ylab="Y Coordinate",main="Prediction Difference",colorkey=list(width=0.75))
+```
+
+

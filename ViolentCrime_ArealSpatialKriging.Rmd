@@ -1,0 +1,228 @@
+---
+title: "Areal Crime Data Kriging"
+date: "April 23, 2015"
+output: html_document
+---
+
+```{r load-data,echo=FALSE, cache=TRUE}
+setwd("/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/CrimeDataSTAnalysis/")
+source("importCrimeData.R")
+filePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/CPD_DWH/"
+fileName <- "X_VIOLENTCRIME_POINTS_01_14.csv"
+CrimeData <- importCrimeData(filePath,fileName)
+```
+
+In this section, cross-sectional data was aggregated by policing beat and used for space-only Gaussian process (a.k.a Kriging in geospatial aera) prediction. To demonstrate the process, we assume we only know the crime counts of each beat and want to predict crime counts for other places by interpolating over a finer grid.
+
+First of all, we need to add up points over beats and create the connection matrix. In the following analysis, we will be using all available data from year 2008 to year 2014.
+
+```{r conn-mat, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=8, fig.height=8, cache=TRUE}
+library(rgdal)
+shapefilePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/CPDShapeFiles/"
+beat.rg <- readOGR(shapefilePath, "beat_bndy")
+
+# centroids 
+Crd.beat <- coordinates(beat.rg)
+
+library(spdep)
+## Contiguity Neighbors
+W_conn.beat <- poly2nb(beat.rg, queen=T)
+W_conn_mat.beat <- nb2listw(W_conn.beat, style="W", zero.policy=TRUE)
+
+plot(beat.rg, border="black",main=list("Beat Centroid Connection",cex=0.75))
+plot(W_conn_mat.beat,coords=Crd.beat, pch=19, cex=0.5, col="blue", add=TRUE)
+```
+
+```{r aggregation, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# aggregate by differenct time units
+CrimeData.beat_month <- aggregate(INC_CNT~BEAT+MONTH,data=CrimeData, FUN=sum, na.rm=TRUE)
+CrimeData.beat_year <- aggregate(INC_CNT~BEAT+YEAR, data=CrimeData, FUN=sum, na.rm=TRUE)
+CrimeData.beat_all <- aggregate(INC_CNT~BEAT,data=CrimeData, FUN=sum, na.rm=TRUE)
+
+# create a spatial polygon data frame template
+beat_template.spdf <- beat.rg
+beat_template.spdf@data$BEAT_NUMBE<- as.factor(as.integer(as.character(beat_template.spdf@data$BEAT_NUMBE)))
+beat_template.spdf@data$INC_CNT <- rep(NA,nrow(beat_template.spdf@data))
+
+beat_all.spdf <- beat_template.spdf
+for (i in unique(CrimeData.beat_all$BEAT)){
+  beat_all.spdf@data$INC_CNT[beat_all.spdf@data$BEAT_NUMBE==i] = 
+    CrimeData.beat_all$INC_CNT[CrimeData.beat_all$BEAT==i]
+}
+```
+
+We look at an omnidirectional variogram cloud first. Note that a variogram cloud is a scatter plot of the set of pairs defined as
+$$
+\{(u_i-u_j, [Z(u_i)-Z(u_j)]^2), \forall i \neq j, i,j=1,2,\ldots,n\}, \text{and } u=u(x,y)
+$$
+As we are dealing with count data, we do a log-transform (add a small number $\epsilon=10^{-6}$ for zero values) of the target variable when calculating the sample variogram.
+
+```{r vgm-cloud, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=6, fig.height=6, cache=TRUE}
+library(gstat)
+library(lattice)
+# variogram cloud
+eps = 1e-6
+vgmCld_a.beat = variogram(log(INC_CNT+eps)~1,locations=coordinates(beat_all.spdf), cutoff = 1e5, data=beat_all.spdf,cloud=TRUE)
+plot(vgmCld_a.beat,pch=16,cex=0.25,ylab = list(label="semivariance",cex=1), xlab = list(label="distance",cex=1),
+     main = list(label="Variogram Cloud (aggregation unit: beat)",cex=1))
+```
+
+Then We fit the sample variogram by three different models assuming a contant trend. The sample variogram is defined as 
+$$
+\gamma(h)=\frac{1}{2N(h)}\sum_{i=1}^{N(h)}[Z(u_i+h)-Z(u_i)]^2
+$$
+
+```{r vgm-mean, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', cache=TRUE}
+# omnidirectional variogram
+vgm.beat = variogram(log(INC_CNT+eps)~1, cutoff = 1e5, data = beat_all.spdf)
+vgmSph.beat= vgm(model="Sph",range=40000, nugget=0.1)
+vgmExp.beat= vgm(model="Exp",range=40000, nugget=0.1)
+vgmGau.beat= vgm(model="Gau",range=40000, nugget=0.1)
+sphfit.beat = fit.variogram(vgm.beat, model=vgmSph.beat)
+expfit.beat = fit.variogram(vgm.beat, model=vgmExp.beat)
+gaufit.beat = fit.variogram(vgm.beat, model=vgmGau.beat)
+
+xyplot(gamma ~ dist, vgm.beat,
+       panel = function(...) {
+         # variogram
+         panel.xyplot(..., col = "blue",cex=1.5)
+         # sphere variogram model
+         vL = variogramLine(sphfit.beat, maxdist = max(vgm.beat$dist))
+         llines(x = vL$dist, y = vL$gamma, col = "red", lty = 1, lwd=1.25) 
+         # exponetial variogram model
+         vL = variogramLine(expfit.beat, maxdist = max(vgm.beat$dist))
+         llines(x = vL$dist, y = vL$gamma, col = "green", lty = 1, lwd=1.25)
+         # exponetial variogram model
+         vL = variogramLine(gaufit.beat, maxdist = max(vgm.beat$dist))
+         llines(x = vL$dist, y = vL$gamma, col = "blue", lty = 1, lwd=1.25)    
+       },
+       ylab = list(label="semivariance",cex=1), xlab = list(label="distance",cex=1),
+       key = list(text = list("Spherical"), lines = list(lwd=1.25, col="red"),
+                  text = list("Exponetial"), lines = list(lwd=1.25, col="green"),
+                  text = list("Gaussian"), lines = list(lwd=1.25, col="blue"),cex=1)
+)
+```
+
+Then assuming a 2D linear trend, we fit the residual sample variogram using the spherical kernel.
+
+```{r vgm-res, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',cache=TRUE}
+# residual variogram w.r.t. a linear trend:
+vgmR.beat = variogram(log(INC_CNT+eps)~coordinates(beat_all.spdf), cutoff = 1e5, data = beat_all.spdf)
+# plot(vgmR.beat)
+vgm.sph= vgm(model="Sph",range=40000, nugget=0.1)
+sphfitR.beat = fit.variogram(vgmR.beat, model=vgm.sph)
+plot(vgmR.beat, model=sphfitR.beat, cex=1.25, lwd=1.25, 
+     ylab = list(label="semivariance",cex=1), xlab = list(label="distance",cex=1),
+     main = list(label="Residual variogram w.r.t. a linear trend and its spherical model fit",cex=1))
+```
+
+We also consider directional variograms: for two point pairs, $Z(s)$ and $Z(s+h)$, the separation vector is $h$ which has a direction. Here, we consider four directions (0: north-south; 45: northeast-southwest; 90: east-west; 135: southeast-northwest). By default, point pairs are assigned to the directional variogram panel with their nearest direction, e.g., North contains everything between -22.5 and 22.5 degrees. In the figure, the kernel model type is spherical and its parameters are set equal to those of the omnidirectional ones. What can be seen is that the city-wide variogram has a directional pattern. 
+
+```{r vgm-dir, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', cache=TRUE}
+# directional variogram
+
+# alpha: direction in plane (x,y), in positive degrees clockwise from positive y (North): 
+# alpha=0 for direction North (increasing y), alpha=90 for direction East (increasing x); 
+# optional a vector of directions in (x,y)
+
+# dirvgm.beat = variogram(INC_CNT~1, data = beat_all.spdf, alpha=c(0,45,90,135))
+# plot(dirvgm.beat,as.table=TRUE)
+
+# change cutoff (spatial separation distance up to which point pairs are included in semivariance estimates)
+dirvgm.beat = variogram(log(INC_CNT+eps)~1, data = beat_all.spdf, cutoff = 1e5, alpha=c(0,45,90,135))
+plot(dirvgm.beat,as.table=TRUE)
+
+# In two dimensions, two parameters define an anisotropy ellipse, say anis = c(30, 0.5). 
+# The first parameter, 30, refers to the main axis direction: 
+# it is the angle for the principal direction of continuity (measured in degrees, clockwise from positive Y, i.e. North). 
+# The second parameter, 0.5, is the anisotropy ratio, the ratio of the minor range to the major range (a value between 0 and 1). 
+# So, in our example, if the range in the major direction (North-East) is 100, 
+# the range in the minor direction (South-East) is 0.5 x 100 = 50.
+
+# dirvgmSph.beat = vgm(model="Sph",range=35000,nugget=2.5e5,anix=c(0,0.6))
+# dirsphfit.beat = fit.variogram(dirvgm.beat, model=dirvgmSph.beat)
+# plot(dirvgm.beat, model=dirsphfit.beat, as.table=TRUE,
+#      ylab = list(label="semivariance",cex=1), xlab = list(label="distance",cex=1))
+```
+
+Now plot (omni-directional) variograms for data aggregated by month. The cold months are less spatially correlated (smaller variances for far away value pairs) than hot months are.
+
+```{r vgm-month, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=9,fig.height=10, cache=TRUE}
+BeatAggregation <- function(spdf,CrimeData,TimeUnit="YEAR",time){
+  for (i in unique(CrimeData$BEAT)){
+    idx <- which(CrimeData$BEAT==i & CrimeData[[TimeUnit]]==time)
+    if (length(idx)==0){
+      spdf@data$INC_CNT[spdf@data$BEAT_NUMBE==i] = 0
+    }
+    else{
+      spdf@data$INC_CNT[spdf@data$BEAT_NUMBE==i] = CrimeData$INC_CNT[idx]
+    }
+  }
+  return(spdf)
+}
+
+par(mfrow=c(4,3),oma=c(0,0,2,0))
+for (j in 1:12){  
+  beat_month.spdf <- BeatAggregation(beat_template.spdf,CrimeData.beat_month,TimeUnit="MONTH",j)  
+  INCm.vgm = variogram(log(INC_CNT+eps)~1,cutoff = 1e5,data=beat_month.spdf)
+  par(mar=c(4,4,3,1.5))
+  plot(INCm.vgm$dist,INCm.vgm$gamma,pch=1,col="blue", main=as.character(j),
+       ylab="semivariance", xlab="distance")
+}
+title(main=list("Variogram for different months", cex=1.25),outer=TRUE)
+```
+
+And plot a variogram for each year. There seems to be a downward trend in terms of spatial correlation.
+
+```{r vgm-year, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=9, fig.height=9, cache=TRUE}
+par(mfrow=c(3,3),oma=c(0,0,2,0))
+for (j in unique(CrimeData.beat_year$YEAR)){  
+  beat_year.spdf <- BeatAggregation(beat_template.spdf,CrimeData.beat_year,TimeUnit="YEAR",j)  
+  INCy.vgm = variogram(log(INC_CNT+eps)~1,cutoff = 1e5,data=beat_year.spdf)
+  par(mar=c(4,4,3,1.5))
+  plot(INCy.vgm$dist,INCy.vgm$gamma,pch=1,col="blue", main=as.character(j),
+       ylab="semivariance", xlab="distance")
+}
+title(main=list("Variogram for each year", cex=1.25),outer=TRUE)
+```
+
+Now let's move forward to Kriging. We fit the sample variogram by a spherical model. Based on this variogram model, we use Gaussian process to "predict" (interpolate) values on a finer (300 $\times$ 300) grid. To relieve the computational burden, local kriging (here 100 nearest observations was used) was applied instend of using all the observations for a single point kriging prediction.
+
+```{r inter-grid, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=6,fig.height=6, cache=TRUE}
+library(sp)
+# cellsizeX = 377
+# cellsizeY = 467
+interpx = 300
+interpy = 300 
+
+plot(beat.rg,border="gray")
+interp.grd <- spsample(beat.rg, n = interpx*interpy, type="regular")
+# interp.grd <- spsample(beat.rg, cellsize=c(cellsizeX,cellsizeY),type="regular",offset = c(0.5,0.5))
+dimnames(interp.grd@coords)[[2]]<-c("X_COORD","Y_COORD")
+dimnames(interp.grd@bbox)[[1]]<-c("X_COORD","Y_COORD")
+points(interp.grd, pch=3, cex=0.2)
+interp.grd <- SpatialPixels(interp.grd)
+```
+
+```{r krige-pred-mean, echo=FALSE, message=TRUE, warning=FALSE, fig.align='center', fig.width=6, fig.height=6, cache=TRUE}
+# For local kriging: the number of nearest observations that should be used for a kriging prediction
+# It will speed up computation, otherwise, it'd use all observations.
+
+nobs <- 100 
+ptm <- proc.time()
+INC.kriged = krige(log(INC_CNT+eps)~1, locations = beat_all.spdf, newdata = interp.grd, nmax = nobs, model = sphfit.beat)
+print("Computing Time:")
+proc.time() - ptm
+INC.krigedDF <- as.data.frame(INC.kriged)
+names(INC.krigedDF)[1:ncol(INC.krigedDF)] <- c("X_COORD","Y_COORD","Pred","Var")
+levelplot(exp(Pred)~X_COORD*Y_COORD, data = INC.krigedDF, col.regions=topo.colors(256),colorkey=list(width=0.75),
+          xlab="X Coordinate",ylab="Y Coordinate",main=list("Kriging Predictions",cex=1))
+```
+
+As Gaussian process is a probabilistic framework, we can also show the one standard errors of interpolations for each location. Except for the corners and the boundaries which lack available data, other locations have very close standard errors.
+
+```{r krige-pred-sd, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=6, fig.height=6, cache=TRUE}
+# standard error/confidence interval plot
+levelplot(exp(sqrt(Var))~X_COORD*Y_COORD, data = INC.krigedDF, col.regions=topo.colors(256),colorkey=list(width=0.75),
+          xlab="X Coordinate",ylab="Y Coordinate",main=list("One standard errors of the kriging predictions",cex=1))
+```

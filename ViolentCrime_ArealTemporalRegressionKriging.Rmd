@@ -1,0 +1,488 @@
+---
+title: "Areal Temperal Regression and S-T Kriging"
+date: "June 4, 2015"
+output: html_document
+---
+
+In this section, the framework is carried out by:
+1. applying Time series prediction over each district/beat;
+2. analyzing and fitting the spatio-temporal variograms of the residuals from time series models;
+3. predicting the residuals (interpolating in a finer spatial grid and exterpolating in time dimension);
+4. summing up the predictions from step 1 and 3 to get the final predictions.
+
+```{r load-crimedata,echo=FALSE, cache=TRUE}
+setwd("/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/CrimeDataSTAnalysis/")
+source("importCrimeData.R")
+filePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/CPD_DWH/"
+fileName <- "X_VIOLENTCRIME_POINTS_01_14.csv"
+CrimeData <- importCrimeData(filePath,fileName)
+```
+
+```{r aggregation,echo=FALSE, cache=TRUE}
+# aggregated by "beat"
+CrimeData.beat_day <- aggregate(INC_CNT~BEAT+DATEOCC+YEAR+MONTH+DOW,data=CrimeData, FUN=sum, na.rm=TRUE)
+CrimeData.beat_day <- CrimeData.beat_day[order(CrimeData.beat_day$DATEOCC),]
+CrimeData.beat_day$DOW <- factor(CrimeData.beat_day$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+# aggregated by "district"
+CrimeData.district_day <- aggregate(INC_CNT~DISTRICT+DATEOCC+YEAR+MONTH+DOW,data=CrimeData, FUN=sum, na.rm=TRUE)
+CrimeData.district_day <- CrimeData.district_day[order(CrimeData.district_day$DATEOCC),]
+CrimeData.district_day$DOW <- factor(CrimeData.district_day$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+```
+
+```{r SpTemplate,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+##  Create Spatio-Temporal irregular layout data 
+library(rgdal)
+shapefilePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/CPDShapeFiles/"
+beat.rg <- readOGR(shapefilePath, "beat_bndy")
+district.rg <- readOGR(shapefilePath, "district_bndy")
+# centroids 
+Crd.beat <- coordinates(beat.rg)
+Crd.district <- coordinates(district.rg)
+# create a spatial polygon data frame template
+library(sp)
+beat_template.spdf <- beat.rg
+beat_template.spdf@data$BEAT_NUMBE <- as.factor(as.integer(as.character(beat_template.spdf@data$BEAT_NUMBE)))
+beat_template.spdf@data$INC_CNT <- rep(NA,nrow(beat_template.spdf@data))
+
+district_template.spdf <- district.rg
+district_template.spdf@data$DISTRICT <- as.factor(as.integer(as.character(district_template.spdf@data$DISTRICT)))
+district_template.spdf@data$INC_CNT <- rep(NA,nrow(district_template.spdf@data))
+
+BeatList <- sort(unique(beat_template.spdf@data$BEAT_NUMBE))
+DistrictList <- sort(unique(district_template.spdf@data$DISTRICT))
+```
+
+```{r load-weatherdata,echo=FALSE, cache=TRUE}
+source("WeatherDataFunctions.R")
+WeatherFilePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/WeatherData/"
+startDate="01/01/2008"
+endDate="12/31/2014"
+#RetrieveWeatherData(startDate, endDate, Path=WeatherFilePath)
+# filename.raw <- paste(WeatherFilePath,'WeatherData_',as.character(as.Date(startDate, "%m/%d/%Y")),'_',
+#                   as.character(as.Date(endDate, "%m/%d/%Y")),'.csv',sep='')
+# WeatherData.daily <- ConvertToDailyWeatherData(filename.raw)
+
+filename.daily <- paste(WeatherFilePath,'WeatherData_Daily_',as.character(as.Date(startDate, "%m/%d/%Y")),
+                        '_',as.character(as.Date(endDate, "%m/%d/%Y")),'.csv',sep='')
+#write.csv(WeatherData.daily, file = filename.daily,row.names=FALSE)
+WeatherData.daily <- read.csv(filename.daily)
+WeatherData.daily$Date <- as.Date(WeatherData.daily$Date)
+
+WeatherData.daily_diff <- DailyWeatherDiff(WeatherData.daily)
+```
+
+After loading crime and weather data (2008/01/01-2014/12/31), we fit a temporal model which is specified below for every beat/district.
+
+The temporal model specifications: 
+
+1. fit the long term trend.
+
+2. get the residuals from the trend fitting and do regression with variables (DOW,weather) using the Lasso.
+
+Note: we do not include lagged variables here so that the temporal autocorrelations would be modelled by Kriging in the following stage. 
+
+```{r district-regTS-spdf, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=8, fig.height=6, cache=TRUE}
+source("STAnalysisFunction.R")
+STdata.district <- ConstructArealSTData(CrimeData.district_day,district_template.spdf,Crd.district,area="DISTRICT") 
+CrimeData_district_day.stfdf <-STdata.district$CrimeData.stfdf 
+CrimeData.district_day <- STdata.district$CrimeData 
+
+CrimeData_district_day.stfdf@data$Pred <- rep(NA,nrow(CrimeData_district_day.stfdf@data))
+CrimeData_district_day.stfdf@data$Resid <- rep(NA,nrow(CrimeData_district_day.stfdf@data))
+
+CrimeData.district_day$Pred <- rep(NA,nrow(CrimeData.district_day))
+CrimeData.district_day$Resid <- rep(NA,nrow(CrimeData.district_day))
+
+TRsp.district <- TemporalRegressionSTDF(area="DISTRICT",crimeData=CrimeData.district_day,glm="gaussian",nlfit="IRLS",
+                               varSet=c("DOW","weather","weatherdiff"),stData=CrimeData_district_day.stfdf,
+                               standardize="minmax")
+CrimeData_district_day.stfdf <- TRsp.district$stData
+CrimeData.district_day <- TRsp.district$CrimeData
+# fitEval.district <- TRsp.district$fitEval
+
+```
+
+```{r beat-regTS-spdf, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=8, fig.height=6, eval=TRUE, cache=TRUE}
+STdata.beat <- ConstructArealSTData(CrimeData.beat_day,beat_template.spdf,Crd.beat,area="BEAT") 
+CrimeData_beat_day.stfdf <-STdata.beat$CrimeData.stfdf 
+CrimeData.beat_day <- STdata.beat$CrimeData 
+
+CrimeData_beat_day.stfdf@data$Pred <- rep(NA,nrow(CrimeData_beat_day.stfdf@data))
+CrimeData_beat_day.stfdf@data$Resid <- rep(NA,nrow(CrimeData_beat_day.stfdf@data))
+
+CrimeData.beat_day$Pred <- rep(NA,nrow(CrimeData.beat_day))
+CrimeData.beat_day$Resid <- rep(NA,nrow(CrimeData.beat_day))
+
+TRsp.beat <- TemporalRegressionSTDF(area="BEAT",crimeData=CrimeData.beat_day,glm="gaussian",nlfit="IRLS",
+                      varSet=c("DOW","weather","weatherdiff"),stData=CrimeData_beat_day.stfdf,standardize="minmax")
+CrimeData_beat_day.stfdf <- TRsp.beat$stData
+CrimeData.beat_day <- TRsp.beat$CrimeData
+# fitEval.beat <- TRsp.beat$fitEval
+```
+
+```{r rename-variable, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+names(CrimeData_district_day.stfdf@data)[names(CrimeData_district_day.stfdf@data)=="Pred"] <- "TSpred"
+names(CrimeData_district_day.stfdf@data)[names(CrimeData_district_day.stfdf@data)=="Resid"] <- "TSresid"
+names(CrimeData.district_day)[names(CrimeData.district_day)=="Pred"] <- "TSpred"
+names(CrimeData.district_day)[names(CrimeData.district_day)=="Resid"] <- "TSresid"
+
+names(CrimeData_beat_day.stfdf@data)[names(CrimeData_beat_day.stfdf@data)=="Pred"] <- "TSpred"
+names(CrimeData_beat_day.stfdf@data)[names(CrimeData_beat_day.stfdf@data)=="Resid"] <- "TSresid"
+names(CrimeData.beat_day)[names(CrimeData.beat_day)=="Pred"] <- "TSpred"
+names(CrimeData.beat_day)[names(CrimeData.beat_day)=="Resid"] <- "TSresid"
+```
+
+We plot the city-wide spatio-temporal variograms. For computational reasons, here we only pool data over 08/01/2013-07/31/2014 and consider time lag up to 14 days. The beat-level and district-level spatio-temporal variograms of temporal model residuals are shown below.
+
+```{r stVgm-beat, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE,eval=TRUE}
+library(gstat)
+timeslot <- "2013-08-01::2014-07-31"
+stVgm.beat <- variogramST(TSresid~1,CrimeData_beat_day.stfdf[,timeslot,"TSresid"],tlags=0:14,progress=FALSE)
+
+f <- plot(stVgm.beat, wireframe=T,zlab=NULL,xlab=list("distance", rot=30), ylab=list("time lag", rot=-35),
+           scales=list(arrows=F,z=list(distance=5)), col.regions=bpy.colors(),colorkey=list(width=0.75))
+print(f)
+```
+
+```{r stVgm-district, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE,eval=TRUE}
+stVgm.district <- variogramST(TSresid~1,CrimeData_district_day.stfdf[,timeslot,"TSresid"],tlags=0:14,progress=FALSE)
+
+f <- plot(stVgm.district, wireframe=T,zlab=NULL,xlab=list("distance", rot=30), ylab=list("time lag", rot=-35),
+           scales=list(arrows=F,z=list(distance=5)), col.regions=bpy.colors(),colorkey=list(width=0.75))
+print(f)
+```
+
+In order to see if which variogram model type (metric, separable or product-sum) is more suitable, we marginalize the data over space and time respectively and plot their variogram clouds and variograms. 
+
+```{r marginalVgm-beat, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=3.5, cache=TRUE,eval=TRUE}
+spaceMargin.beat <- aggregate(CrimeData_beat_day.stfdf[,timeslot,"TSresid"],by="time",FUN=mean)
+timeMargin.beat <- aggregate(CrimeData_beat_day.stfdf[,timeslot,"TSresid"],by="space",FUN=mean)
+
+spVgm.beat = variogram(TSresid~1, data=spaceMargin.beat)
+spVgmCld.beat = variogram(TSresid~1,locations=coordinates(spaceMargin.beat),data=spaceMargin.beat, cloud=TRUE)
+
+f1 <- plot(spVgmCld.beat,main=list("Beat-level spatial marginal variogram cloud",cex=0.75),pch=16,cex=0.5)
+f2 <- plot(spVgm.beat,main=list("Beat-level spatial marginal variogram",cex=0.75),pch=16,cex=0.5)
+print(f1, position=c(0, 0, 0.5, 1), more=TRUE)
+print(f2, position=c(0.5, 0, 1, 1))
+
+library(nlme)
+tVgmCld.beat <- Variogram(as.vector(timeMargin.beat),dist(1:length(timeMargin.beat)))
+tVgmCld.beat <- subset(tVgmCld.beat,dist<=length(timeMargin.beat)/3)
+tVgm.beat <- aggregate(.~dist,tVgmCld.beat,FUN=mean)
+tVgm.beat <- rbind(c(variog=0,dist=0),tVgm.beat)
+class(tVgm.beat) <- c("Variogram", "data.frame")
+
+f1 <- plot(tVgmCld.beat,xlab="time lag",main=list("Beat-level temporal marginal variogram cloud",cex=0.75),
+           smooth=FALSE,pch=16,cex=0.5)
+f2 <- plot(tVgm.beat[1:round(length(timeMargin.beat)/3),],xlab="time lag",
+           main=list("Beat-level temporal marginal variogram",cex=0.75),smooth=FALSE,pch=16,cex=0.5)
+print(f1, position=c(0, 0, 0.5, 1), more=TRUE)
+print(f2, position=c(0.5, 0, 1, 1))
+```
+
+```{r marginalVgm-district, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=3.5, cache=TRUE,eval=TRUE}
+# Set all the values of Pred and Resid of district 31 to be zero
+CrimeData_district_day.stfdf@data[CrimeData_district_day.stfdf@data$DISTRICT==31,c("TSpred","TSresid")]=0 
+CrimeData.district_day[CrimeData.district_day$DISTRICT==31,c("TSpred","TSresid")]=0 
+
+spaceMargin.district <- aggregate(CrimeData_district_day.stfdf[,timeslot,"TSresid"],by="time",FUN=mean)
+timeMargin.district <- aggregate(CrimeData_district_day.stfdf[,timeslot,"TSresid"],by="space",FUN=mean)
+
+spVgm.district = variogram(TSresid~1, data=spaceMargin.district)
+spVgmCld.district = variogram(TSresid~1,locations=coordinates(spaceMargin.district),data=spaceMargin.district, cloud=TRUE)
+
+f1 <- plot(spVgmCld.district,main=list("District-level spatial marginal variogram cloud",cex=0.75),pch=16,cex=0.5)
+f2 <- plot(spVgm.district,main=list("District-level spatial marginal variogram",cex=0.75),pch=16,cex=0.5)
+print(f1, position=c(0, 0, 0.5, 1), more=TRUE)
+print(f2, position=c(0.5, 0, 1, 1))
+
+library(nlme)
+tVgmCld.district <- Variogram(as.vector(timeMargin.district),dist(1:length(timeMargin.district)))
+tVgmCld.district <- subset(tVgmCld.district,dist<=length(timeMargin.district)/3)
+tVgm.district <- aggregate(.~dist,tVgmCld.district,FUN=mean)
+tVgm.district <- rbind(c(variog=0,dist=0),tVgm.district)
+class(tVgm.district) <- c("Variogram", "data.frame")
+
+f1 <- plot(tVgmCld.district,xlab="time lag",main=list("District-level temporal marginal variogram cloud",cex=0.75),
+           smooth=FALSE,pch=16,cex=0.5)
+f2 <- plot(tVgm.district[1:round(length(timeMargin.district)/3),],xlab="time lag",
+           main=list("District-level temporal marginal variogram",cex=0.75),smooth=FALSE,pch=16,cex=0.5)
+print(f1, position=c(0, 0, 0.5, 1), more=TRUE)
+print(f2, position=c(0.5, 0, 1, 1))
+```
+
+
+Then we fit the variogram by different types of ST variogram.
+
+NOTE: 
+
+1. For the "metric" model, the spatio-temporal distance ratio is set to 2500
+
+2. the nonlinear fitting (in least squares sense) is sensitive to the initial values as well as the optimization methods (here we apply L-BFGS)
+
+```{r stVgm-beat-fit, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE, eval=TRUE}
+NumBeat <- length(BeatList)
+stRatio <- 2500
+methods = c("metric","separable","productSum")
+
+vgm1.beat <- vgmST(methods[1],joint=vgm(psill=0.1,"Sph",range=30000, nugget=0.75),stAni=stRatio)
+vgm1.beat_fit <- fit.StVariogram(stVgm.beat,vgm1.beat)
+
+vgm2.beat <- vgmST(methods[2],space=vgm(psill=0.002,"Sph",range=30000, nugget=0.0035),time=vgm(psill=0.004,"Sph",range=20,nugget=0.003), sill=0.85)
+vgm2.beat_fit <- fit.StVariogram(stVgm.beat,vgm2.beat,method="L-BFGS-B")
+
+vgm3.beat <- vgmST(methods[3],space=vgm(psill=0.002,"Sph",range=30000, nugget=0.0035),time=vgm(psill=0.004,"Sph",range=20,nugget=0.003), sill=0.5, nugget=0.75)
+vgm3.beat_fit <- fit.StVariogram(stVgm.beat,vgm3.beat,method="L-BFGS-B")
+
+library(lattice)
+plot(stVgm.beat,list(vgm1.beat_fit,vgm2.beat_fit,vgm3.beat_fit), all=T, wireframe=T, zlab=NULL, xlab=list("distance", rot=30), 
+     ylab=list("time lag", rot=-35),scales=list(arrows=F,z=list(distance=5)), colorkey=list(width=0.75))
+```
+
+```{r stVgm-district-fit, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE, eval=TRUE}
+NumDistrict <- length(DistrictList)
+
+vgm1.district <- vgmST(methods[1],joint=vgm(psill=7,"Sph",range=30000, nugget=8),stAni=stRatio)
+vgm1.district_fit <- fit.StVariogram(stVgm.district,vgm1.district)
+
+vgm2.district <- vgmST(methods[2],space=vgm(psill=0.2,"Sph",range=30000, nugget=0.05),time=vgm(psill=0.9,"Sph",range=20,nugget=0.1), sill=15)
+vgm2.district_fit <- fit.StVariogram(stVgm.district,vgm2.district,method="L-BFGS-B")
+
+vgm3.district <- vgmST(methods[3],space=vgm(psill=0.2,"Sph",range=30000, nugget=0.05),time=vgm(psill=0.9,"Sph",range=20,nugget=0.1), sill=14, nugget=8)
+vgm3.district_fit <- fit.StVariogram(stVgm.district,vgm3.district,method="L-BFGS-B")
+
+plot(stVgm.district,list(vgm1.district_fit,vgm2.district_fit,vgm3.district_fit), all=T, wireframe=T, 
+     zlab=NULL, xlab=list("distance", rot=30), ylab=list("time lag", rot=-35),
+     scales=list(arrows=F,z=list(distance=5)), colorkey=list(width=0.75))
+```
+
+The poorly fitting results imply that we should do a "moving window" and dig into local variogram instead of estimating a pooled global variogram. This non-stationarity needs further research work.
+
+For now, let us stick with the global estimated variogram. We would like to predict next two day's violent crime distribution. The spatial interpolation was done over a $100 \times 100$ regular grid within the city border.
+
+```{r predGrid, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE, eval=TRUE}
+## set up prediction grid
+# temporal grid
+library(xts)
+# extrapolation
+pred.ndays <- 2
+grd.beat_t <- xts(1:pred.ndays,order.by=seq(max(index(CrimeData_beat_day.stfdf[,timeslot]))+1,
+                                       max(index(CrimeData_beat_day.stfdf[,timeslot]))+pred.ndays,length=pred.ndays))
+
+# spatial interpolation grid
+# cellsizeX = 377
+# cellsizeY = 467
+interpx = 100
+interpy = 100 
+
+grd.beat_s <- spsample(beat_template.spdf, n = interpx*interpy, type="regular")
+# grd.s <- spsample(beat.rg, cellsize=c(cellsizeX,cellsizeY),type="regular",offset = c(0.5,0.5))
+dimnames(grd.beat_s@coords)[[2]]<-c("X_COORD","Y_COORD")
+dimnames(grd.beat_s@bbox)[[1]]<-c("X_COORD","Y_COORD")
+grd.beat_s <- SpatialPixels(grd.beat_s)
+
+# match grid projection
+# grd.s <- spTransform(grd.s, CRS("+proj=utm +zone=16 +datum=WGS84"))
+# CrimeData_beat_day.stfdf <- spTransform(CrimeData_beat_day.stfdf, CRS(proj4string(grd.s)))
+
+# spatio-temporal grid
+grd.beat_st <- STF(grd.beat_s,grd.beat_t)
+
+grd.district_t <- xts(1:pred.ndays,order.by=seq(max(index(CrimeData_district_day.stfdf[,timeslot]))+1,
+                                       max(index(CrimeData_district_day.stfdf[,timeslot]))+pred.ndays,length=pred.ndays))
+grd.district_s <- spsample(district_template.spdf, n = interpx*interpy, type="regular")
+dimnames(grd.district_s@coords)[[2]]<-c("X_COORD","Y_COORD")
+dimnames(grd.district_s@bbox)[[1]]<-c("X_COORD","Y_COORD")
+grd.district_s <- SpatialPixels(grd.district_s)
+
+grd.district_st <- STF(grd.district_s,grd.district_t)
+```
+
+Since some the variogram fittings yield quite flat surface, the corresponding covariance matrices are not be positive definte (A variogram model that does not discriminate observations sufficiently, leading to near-perfectly correlated observations.). Here we adjust the intial values of the nonlinear fitting for the product-sum model so that it is positive definite, even though the it was not the best in terms of MSE.
+
+Again, although the S-T variogram was estimated globally, when computing the convariance matrix inserse, only 200 local (in terms of distance) entries are taken into account for computational consideration. 
+
+```{r STkrige-beat, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE, eval=TRUE}
+## 
+# **Error in chol.default(A) : 
+#   **the leading minor of order XX is not positive definite
+# There are several possibilities that lead to a singular covariance matrix. Two common ones:  
+# 1. duplicate observations (identical location & time stamp),
+# 2. a variogram model that does not discriminate observations sufficiently, leading to near-perfectly correlated observations.
+##
+
+# local kriging
+ptm <- proc.time()
+attr(vgm3.beat_fit, "temporal unit") <- "days"
+predST.beat <- krigeST(TSresid~1, data=CrimeData_beat_day.stfdf[,timeslot,"TSresid"], newdata=grd.beat_st, 
+                   modelList=vgm3.beat_fit, nmax=200, stAni=stRatio, computeVar=F,progress=F)
+proc.time() - ptm
+
+krigeST.beat <- as.data.frame(predST.beat)
+krigeST.beat$endTime <- NULL
+krigeST.beat$sp.ID <- NULL
+krigeST.beat$V1 <- NULL
+names(krigeST.beat)[1:ncol(krigeST.beat)] <- c("X_COORD","Y_COORD","DATEOCC","krigePred")
+```
+
+```{r STkrige-district, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE, eval=TRUE}
+# local kriging
+ptm <- proc.time()
+attr(vgm3.district_fit, "temporal unit") <- "days"
+predST.district <- krigeST(TSresid~1, data=CrimeData_district_day.stfdf[,timeslot,"TSresid"], newdata=grd.district_st, 
+                   modelList=vgm3.district_fit, nmax=200, stAni=stRatio, computeVar=F,progress=F)
+proc.time() - ptm
+
+krigeST.district <- as.data.frame(predST.district)
+krigeST.district$endTime <- NULL
+krigeST.district$sp.ID <- NULL
+krigeST.district$V1 <- NULL
+names(krigeST.district)[1:ncol(krigeST.district)] <- c("X_COORD","Y_COORD","DATEOCC","krigePred")
+```
+
+```{r sort-results-beat, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE, eval=TRUE}
+selectedDay <- "2014-08-01::2014-08-02"
+if (class(CrimeData_beat_day.stfdf[,selectedDay])=="STFDF"){
+  Pred.sample <- as.data.frame(CrimeData_beat_day.stfdf[,selectedDay])
+  Pred.sample$BEAT <- factor(Pred.sample$BEAT,levels=levels(Pred.sample$sp.ID))
+  Pred.sample$endTime <- NULL
+  Pred.sample$sp.ID <- NULL
+  Pred.sample$DATEOCC <- NULL
+  Pred.sample$timeIndex <- NULL
+  names(Pred.sample)[names(Pred.sample)=="time"] <- "DATEOCC"
+  names(Pred.sample)[names(Pred.sample)=="sp.ID"] <- "BEAT"
+}else{
+  Pred.sample <- as.data.frame(CrimeData_beat_day.stfdf[,selectedDay])
+  #---- for single day selection, STFDF will be converted to SPDF, need further work 
+}
+
+beatPred_template.spdf <- beat_template.spdf
+beatPred_template.spdf@data$TSpred <- rep(NA,nrow(beatPred_template.spdf@data))
+beatPred_template.spdf@data$TSresid <- rep(NA,nrow(beatPred_template.spdf@data))
+beatPred_template.spdf@data$krigePred <- rep(NA,nrow(beatPred_template.spdf@data))
+
+beatPredResult.df <- data.frame(matrix(ncol=9, nrow=nrow(krigeST.beat)))
+colnames(beatPredResult.df) <- c("X_COORD","Y_COORD","DATEOCC","BEAT","INC_CNT","TSpred","TSresid","krigePred","overlayPred")
+beatPredResult.df$DATEOCC <- krigeST.beat$DATEOCC
+
+predDate <- as.Date(c("2014-08-01","2014-08-02"))
+for (i in predDate){
+  beatPred.spdf <- beatPred_template.spdf
+  for (j in BeatList){
+    Pred.sample_sub= subset(Pred.sample,DATEOCC==i&BEAT==j)
+    
+    beatPred.spdf@data$INC_CNT[beatPred.spdf@data$BEAT_NUMBE==j] = Pred.sample_sub$INC_CNT
+    beatPred.spdf@data$TSpred[beatPred.spdf@data$BEAT_NUMBE==j] = Pred.sample_sub$TSpred
+    beatPred.spdf@data$TSresid[beatPred.spdf@data$BEAT_NUMBE==j] = Pred.sample_sub$TSresid
+  } 
+  
+  polysample.df <- over(grd.beat_s,beatPred.spdf)
+  
+  polysample.df <- subset(cbind(polysample.df, grd.beat_s@coords),select=-c(SHAPE_AREA,SHAPE_LEN))
+  names(polysample.df)[names(polysample.df)=="BEAT_NUMBE"] <- "BEAT"
+    
+  PredResultSub.df <- subset(krigeST.beat, DATEOCC==i)
+  PredResultSub.df <- merge(PredResultSub.df,polysample.df,by=c("X_COORD","Y_COORD"),all=TRUE)
+  PredResultSub.df$krigePred.y <- NULL                                
+  names(PredResultSub.df)[names(PredResultSub.df)=="krigePred.x"] <- "krigePred"
+  PredResultSub.df$overlayPred <- PredResultSub.df$TSpred + PredResultSub.df$krigePred
+  
+  beatPredResult.df[beatPredResult.df$DATEOCC==i,names(PredResultSub.df)] <- PredResultSub.df
+}
+```
+
+```{r sort-results-district, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE, eval=TRUE}
+if (class(CrimeData_district_day.stfdf[,selectedDay])=="STFDF"){
+  Pred.sample <- as.data.frame(CrimeData_district_day.stfdf[,selectedDay])
+  Pred.sample$DISTRICT <- factor(Pred.sample$DISTRICT,levels=levels(Pred.sample$sp.ID))
+  Pred.sample$endTime <- NULL
+  Pred.sample$sp.ID <- NULL
+  Pred.sample$DATEOCC <- NULL
+  Pred.sample$timeIndex <- NULL
+  names(Pred.sample)[names(Pred.sample)=="time"] <- "DATEOCC"
+  names(Pred.sample)[names(Pred.sample)=="sp.ID"] <- "DISTRICT"
+}else{
+  Pred.sample <- as.data.frame(CrimeData_district_day.stfdf[,selectedDay])
+  #---- for single day selection, STFDF will be converted to SPDF, need further work 
+}
+
+districtPred_template.spdf <- district_template.spdf
+districtPred_template.spdf@data$TSpred <- rep(NA,nrow(districtPred_template.spdf@data))
+districtPred_template.spdf@data$TSresid <- rep(NA,nrow(districtPred_template.spdf@data))
+districtPred_template.spdf@data$krigePred <- rep(NA,nrow(districtPred_template.spdf@data))
+
+districtPredResult.df <- data.frame(matrix(ncol=9, nrow=nrow(krigeST.district)))
+colnames(districtPredResult.df) <- c("X_COORD","Y_COORD","DATEOCC","DISTRICT","INC_CNT",
+                                     "TSpred","TSresid","krigePred","overlayPred")
+districtPredResult.df$DATEOCC <- krigeST.district$DATEOCC
+
+predDate <- as.Date(c("2014-08-01","2014-08-02"))
+for (i in predDate){
+  districtPred.spdf <- districtPred_template.spdf
+  for (j in DistrictList){
+    Pred.sample_sub= subset(Pred.sample,DATEOCC==i&DISTRICT==j)
+    
+    districtPred.spdf@data$INC_CNT[districtPred.spdf@data$DISTRICT==j] = Pred.sample_sub$INC_CNT
+    districtPred.spdf@data$TSpred[districtPred.spdf@data$DISTRICT==j] = Pred.sample_sub$TSpred
+    districtPred.spdf@data$TSresid[districtPred.spdf@data$DISTRICT==j] = Pred.sample_sub$TSresid
+  } 
+  
+  polysample.df <- over(grd.district_s,districtPred.spdf)
+  
+  polysample.df <- subset(cbind(polysample.df, grd.district_s@coords),select=-c(SHAPE_AREA,SHAPE_LEN))
+    
+  PredResultSub.df <- subset(krigeST.district, DATEOCC==i)
+  PredResultSub.df <- merge(PredResultSub.df,polysample.df,by=c("X_COORD","Y_COORD"),all=TRUE)
+  PredResultSub.df$krigePred.y <- NULL                                
+  names(PredResultSub.df)[names(PredResultSub.df)=="krigePred.x"] <- "krigePred"
+  PredResultSub.df$overlayPred <- PredResultSub.df$TSpred + PredResultSub.df$krigePred
+  
+  districtPredResult.df[districtPredResult.df$DATEOCC==i,names(PredResultSub.df)] <- PredResultSub.df
+}
+```
+
+Display the prediction results which are the summation of the temporal model predictions and the residual Kriging prediction, overlayed by the acutal incidents. For completeness, the time series predictions and the corresponding residual kriging predictions are also shown below.
+
+Beat level:
+
+```{r display-results-beat, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE, eval=TRUE}
+## Superimpose the acutal observations
+CrimeActualPts <- subset(CrimeData,DATEOCC %in% predDate,select=c("DATEOCC","X_COORD","Y_COORD","INC_CNT"))
+
+library(latticeExtra)
+f1 <- levelplot(overlayPred~X_COORD+Y_COORD|DATEOCC, data=beatPredResult.df,col.regions=topo.colors(256),
+                colorkey=list(width=0.75),xlab="X Coordinate",ylab="Y Coordinate",
+                main=list("Prediction and Actual Incident Locations",cex=0.75))
+f2 <- xyplot(Y_COORD~X_COORD|DATEOCC, data=CrimeActualPts, pch=16,col="red",cex=0.35,colorkey=list(width=0.75))
+print(f1+as.layer(f2))
+
+f3 <- levelplot(TSpred~X_COORD+Y_COORD|DATEOCC, data=beatPredResult.df,col.regions=topo.colors(256),colorkey=list(width=0.75),
+                xlab="X Coordinate",ylab="Y Coordinate",main=list("Beat Level Time Series Prediction",cex=0.75))
+print(f3)
+
+f4 <- levelplot(krigePred~X_COORD+Y_COORD|DATEOCC, data=beatPredResult.df,col.regions=topo.colors(256),colorkey=list(width=0.75),
+                xlab="X Coordinate",ylab="Y Coordinate",main=list("Residual Kriging Prediction",cex=0.75))
+print(f4)
+```
+
+District level:
+
+```{r display-results-district, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=7.5, fig.height=5.5, cache=TRUE, eval=TRUE}
+
+f1 <- levelplot(overlayPred~X_COORD+Y_COORD|DATEOCC, data=districtPredResult.df,col.regions=topo.colors(256),
+                colorkey=list(width=0.75),xlab="X Coordinate",ylab="Y Coordinate",
+                main=list("Prediction and Actual Incident Locations",cex=0.75))
+f2 <- xyplot(Y_COORD~X_COORD|DATEOCC, data=CrimeActualPts, pch=16,col="red",cex=0.35,colorkey=list(width=0.75))
+print(f1+as.layer(f2))
+
+f3 <- levelplot(TSpred~X_COORD+Y_COORD|DATEOCC, data=districtPredResult.df,col.regions=topo.colors(256),
+                colorkey=list(width=0.75),xlab="X Coordinate",ylab="Y Coordinate",
+                main=list("District Level Time Series Prediction",cex=0.75))
+print(f3)
+
+f4 <- levelplot(krigePred~X_COORD+Y_COORD|DATEOCC, data=districtPredResult.df,col.regions=topo.colors(256),
+                colorkey=list(width=0.75),xlab="X Coordinate",ylab="Y Coordinate",
+                main=list("Residual Kriging Prediction",cex=0.75))
+print(f4)
+```

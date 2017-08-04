@@ -1,0 +1,229 @@
+---
+title: "Pixel-based Violent Crime Spatial Kriging"
+date: "April 20, 2015"
+output: html_document
+---
+
+```{r load-data,echo=FALSE, cache=TRUE}
+setwd("/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/CrimeDataSTAnalysis/")
+source("importCrimeData.R")
+filePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/CPD_DWH/"
+fileName <- "X_VIOLENTCRIME_POINTS_01_14.csv"
+CrimeData <- importCrimeData(filePath,fileName)
+```
+
+In this section, cross-sectional data was pooled and used for space-only Gaussian process (a.k.a Kriging in geo-spatial field) prediction.
+
+First of all, we need to add up points over certain grids. The point data was rasterized through binning into a 50 $\times$ 50 grid (the boundaries were defined by the range of x-coordinate and y-coordinate from all available crime locations plus a margin of 1000 unit on each side). The resolution of a finer grid which will be interpolated on is 300 $\times$ 300
+
+```{r grid, echo=FALSE, message=FALSE,warning=FALSE, cache=TRUE}
+X_range = range(CrimeData$X_COORD)
+Y_range = range(CrimeData$Y_COORD)
+margin = 1000
+X_range[1] <- X_range[1]-margin
+X_range[2] <- X_range[2]+margin
+Y_range[1] <- Y_range[1]-margin
+Y_range[2] <- Y_range[2]+margin
+ncellx = 50
+ncelly = 50
+interpx = 300
+interpy = 300 
+
+library(sp)
+interp.grd <- expand.grid(list(X_COORD = seq(X_range[1], X_range[2], length.out=interpx), 
+                              Y_COORD = seq(Y_range[1], Y_range[2], length.out=interpy)))
+interp.grd <- SpatialPixels(SpatialPoints(interp.grd))
+```
+
+Next we calculate sample variograms of the data. Here we show an exmaple using all available data from year 2008 to year 2014 aggregated over the grid we just created. 
+
+```{r pixel-data, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=6, fig.height=6, cache=TRUE}
+library(raster)
+library(lattice)
+
+# Set up (full grid) pixelized data frames 
+r <- raster(ncol=ncellx,nrow=ncelly,xmn=X_range[1],xmx=X_range[2],ymn=Y_range[1],ymx=Y_range[2])
+CrimeData.sub <- subset(CrimeData,select=c(DATEOCC,YEAR,MONTH,X_COORD,Y_COORD,INC_CNT))
+sub.raster <- rasterize(CrimeData.sub[,c("X_COORD","Y_COORD")], r, CrimeData.sub$INC_CNT, fun=sum)
+sub.df <- as.data.frame(sub.raster,xy=TRUE,centroids=TRUE)
+names(sub.df)[1:ncol(sub.df)] <- c("X_COORD","Y_COORD","INC_CNT")
+sub.df$INC_CNT[is.na(sub.df$INC_CNT)]=0  #replace NA's by zeros
+# convert to spatial_point_data_frame
+coordinates(sub.df)=~X_COORD+Y_COORD
+
+# The original pixel heat map 
+# plot(Ysub.raster,panel.first=grid(ncellx,ncelly,col = "lightgray", lty = "dotted"),col=topo.colors(256),
+#      xlab="X Coordinate",ylab="Y Coordinate", main="Histogram on 50 by 50 grid (2014)")
+levelplot(INC_CNT~x+y, data=as.data.frame(sub.df),col.regions=topo.colors(256),colorkey=list(width=0.75),
+          xlab="X Coordinate",ylab="Y Coordinate", main=list("Histogram on 50 by 50 grid",cex=1))
+```
+
+We look at an omnidirectional variogram first. We fit the sample variogram by three different models, namely, 
+
+spherical model 
+$$
+\gamma(h) =
+\begin{cases}
+C_{0}[\frac{3h}{2a_0}-\frac{1}{2}(\frac{h}{a_0})^3], & h \leq a_0\\
+C_{0}, & h > a_0
+\end{cases}
+$$
+exponential model
+$$
+\gamma(h) =
+C_{0}[1-\exp(-\frac{h}{a_0})]
+$$
+and Gaussian model
+$$
+\gamma(h) =
+C_{0}[1-\exp(-\frac{h^2}{a_{0}^{2}})]
+$$
+
+Where $C_0$ is the nugget and $a_0$ is the range. In the following variogram fit, we assume a contant trend and set the intial guesses of $C_0=50000$ and $a_0=40000$. The length of the diagonal of the image spanning the data is divided by three was used to be the spatial separation distance up to which point pairs are included in semivariance estimates. 1/15 of the spatial separation distance was used to be the width of subsequent distance intervals into which data point pairs are grouped for semivariance estimates.
+
+Variogram models can be fitted to the sample variogram using weighted least squares (WLS) estimation. Non-linear least squares fitting is only guaranteed to work when good initial values are provided. Therefore, and more in general, visual examination of model fit is recommended.
+
+```{r vgm-cloud, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', cache=TRUE, eval=FALSE}
+# variogram cloud
+INC.vgmCld = variogram(INC_CNT~1, data = sub.df, cloud=TRUE)
+# vgmCld_a.beat = variogram(log(INC_CNT+eps)~1,locations=coordinates(beat_all.spdf), cutoff = 1e5, data=beat_all.spdf,cloud=TRUE)
+plot(INC.vgmCld,pch=16,cex=0.25,ylab = list(label="semivariance",cex=1), xlab = list(label="distance",cex=1),
+     main = list(label="Variogram Cloud",cex=1))
+
+```
+
+WLS fitting:
+
+```{r vgm-mean_wls, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', cache=TRUE}
+library(gstat)
+
+# If fitting the range(s) is part of the job of this function, the results may well depend on the starting values, given in argument model. This is nothing new, but generally true for non-linear regression problems. This function uses the internal gstat (C) code, which iterates over (a) a direct (ordinary or weighted least squares) fit of the partial sills and (b) an iterated search, using gradients, for the optimal range value(s), until convergence of after a combined step ((a) and (b)) is reached.
+
+# omnidirectional variogram
+INC.vgm = variogram(INC_CNT~1, data = sub.df)
+vgm.sph= vgm(model="Sph",range=40000,nugget=5e4)
+vgm.exp= vgm(model="Exp",range=40000,nugget=5e4)
+vgm.gau= vgm(model="Gau",range=40000,nugget=5e4)
+
+INC.sphfit = fit.variogram(INC.vgm, model=vgm.sph)
+INC.expfit = fit.variogram(INC.vgm, model=vgm.exp)
+INC.gaufit = fit.variogram(INC.vgm, model=vgm.gau)
+
+xyplot(gamma ~ dist, INC.vgm,
+       panel = function(...) {
+         # variogram
+         panel.xyplot(..., col = "blue",cex=1.25)
+         # sphere variogram model
+         vL = variogramLine(INC.sphfit, maxdist = max(INC.vgm$dist))
+         llines(x = vL$dist, y = vL$gamma, col = "red", lty = 1, lwd=1.25) 
+         # exponetial variogram model
+         vL = variogramLine(INC.expfit, maxdist = max(INC.vgm$dist))
+         llines(x = vL$dist, y = vL$gamma, col = "green", lty = 1, lwd=1.25)
+         # Gaussian variogram model
+         vL = variogramLine(INC.gaufit, maxdist = max(INC.vgm$dist))
+         llines(x = vL$dist, y = vL$gamma, col = "blue", lty = 1, lwd=1.25)    
+       },
+       ylab = list(label="semivariance",cex=1), xlab = list(label="distance",cex=1),ylim=c(0,4.5e5),
+       key = list(text = list("Spherical"), lines = list(lwd=1.25, col="red"),
+                  text = list("Exponetial"), lines = list(lwd=1.25, col="green"),
+                  text = list("Gaussian"), lines = list(lwd=1.25, col="blue"),cex=1)
+)
+```
+
+Instead of a constant mean, we assume there is a linear 2D trend. Then the residual variogram is plotted as below, which looks like almost identical to the one with respect to a constant mean.
+
+```{r vgm-res, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', cache=TRUE}
+# residual variogram w.r.t. a linear trend:
+INC_r.vgm = variogram(INC_CNT~X_COORD+Y_COORD, data = sub.df)
+vgm.sph= vgm(model="Sph",range=40000, nugget=5e4)
+INC_r.sphfit = fit.variogram(INC_r.vgm, model=vgm.sph)
+plot(INC_r.vgm, model=INC_r.sphfit, cex=1.25, lwd=1.25, 
+     ylab = list(label="semivariance",cex=1), xlab = list(label="distance",cex=1),
+     main = list(label="Residual variogram w.r.t. a linear trend and its spherical model fit",cex=1))
+```
+
+We also consider directional variograms: for two point pairs, $Z(s)$ and $Z(s+h)$, the separation vector is $h$ which has a direction. Here, we consider four directions (0: north-south; 45: northeast-southwest; 90: east-west; 135: southeast-northwest). By default, point pairs are assigned to the directional variogram panel with their nearest direction, e.g., North contains everything between -22.5 and 22.5 degrees. In the figure, the kernel model type is spherical and its parameters are set equal to those of the omnidirectional ones. 
+
+```{r vgm-dir, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', cache=TRUE}
+# directional variogram
+
+# alpha: direction in plane (x,y), in positive degrees clockwise from positive y (North): 
+# alpha=0 for direction North (increasing y), alpha=90 for direction East (increasing x); 
+# optional a vector of directions in (x,y)
+INC.dirvgm = variogram(INC_CNT~1, data = sub.df, alpha=c(0,45,90,135))
+
+# In two dimensions, two parameters define an anisotropy ellipse, say anis = c(30, 0.5). 
+# The first parameter, 30, refers to the main axis direction: 
+# it is the angle for the principal direction of continuity (measured in degrees, clockwise from positive Y, i.e. North). 
+# The second parameter, 0.5, is the anisotropy ratio, the ratio of the minor range to the major range (a value between 0 and 1). 
+# So, in our example, if the range in the major direction (North-East) is 100, 
+# the range in the minor direction (South-East) is 0.5 x 100 = 50.
+dirvgm.sph = vgm(model="Sph",range=40000,nugget=5e4,anix=c(0,0.6))
+INC.dirsphfit = fit.variogram(INC.dirvgm, model=dirvgm.sph)
+plot(INC.dirvgm, model=INC.dirsphfit, as.table=TRUE,
+     ylab = list(label="semivariance",cex=1), xlab = list(label="distance",cex=1))
+```
+
+Now plot variograms for data aggregated by month. The cold months are less spatially correlated (smaller variances for far away value pairs) than hot months are.
+
+```{r vgm-month, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=9,fig.height=10, cache=TRUE}
+par(mfrow=c(4,3),oma=c(0,0,2,0))
+for (j in 1:12){
+  Msub <- subset(CrimeData,MONTH==j,select=c(DATEOCC,X_COORD,Y_COORD,INC_CNT))
+  Msub.raster <- rasterize(Msub[,c("X_COORD","Y_COORD")], r, Msub$INC_CNT, fun=sum)
+  Msub.df <- as.data.frame(Msub.raster,xy=TRUE,centroids=TRUE)
+  names(Msub.df)[1:ncol(Msub.df)] <- c("X_COORD","Y_COORD","INC_CNT")
+  Msub.df$INC_CNT[is.na(Msub.df$INC_CNT)]=0  #replace NA's by zeros  
+  coordinates(Msub.df) = ~X_COORD+Y_COORD
+  INCm.vgm = variogram(INC_CNT~1,data=Msub.df)
+  par(mar=c(4,4,3,1.5))
+  plot(INCm.vgm$dist,INCm.vgm$gamma,pch=1,col="blue", main=as.character(j),
+       ylab="semivariance", xlab="distance",ylim=c(0,4500))
+}
+title(main=list("Variogram for different months", cex=1.25),outer=TRUE)
+```
+
+And plot a variogram for each year. There seems to be a downward trend for spatial correlation.
+
+```{r vgm-year, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=9, fig.height=9, cache=TRUE}
+par(mfrow=c(3,3),oma=c(0,0,2,0))
+for (k in unique(CrimeData$YEAR)){
+  Ysub <- subset(CrimeData,YEAR==k,select=c(DATEOCC,X_COORD,Y_COORD,INC_CNT))
+  Ysub.raster <- rasterize(Ysub[,c("X_COORD","Y_COORD")], r, Ysub$INC_CNT, fun=sum)
+  Ysub.df <- as.data.frame(Ysub.raster,xy=TRUE,centroids=TRUE)
+  names(Ysub.df)[1:ncol(Ysub.df)] <- c("X_COORD","Y_COORD","INC_CNT")
+  Ysub.df$INC_CNT[is.na(Ysub.df$INC_CNT)]=0  #replace NA's by zeros  
+  coordinates(Ysub.df) = ~X_COORD+Y_COORD
+  INCy.vgm = variogram(INC_CNT~1,data=Ysub.df)
+  plot(INCy.vgm$dist,INCy.vgm$gamma,pch=1,col="blue", main=as.character(k),
+       ylab="semivariance", xlab="distance", ylim=c(0,14000))
+}
+title(main=list("Variogram for each year", cex=1.25),outer=TRUE)
+```
+
+However, for each individual plot, we can not observe any significant patterns such as trend (empirical semivariograms keep climbing up without an obvious sill), or cyclicity.
+
+Now let's move forward to Kriging. Here we just want to demonstrate by an example which all the incident data was rasterized through binning into a 50 $\times$ 50 grid. Then we fit the sample variogram by a spherical model. Based on this variogram model, we use Gaussian process to interpolate values into a finer (300 $\times$ 300) grid. To relieve the computational burden, local kriging (here 100 nearest observations was used) was applied instend of using all the observations for a single point kriging prediction.
+
+```{r krige-pred-mean, echo=FALSE, message=TRUE, warning=FALSE, fig.align='center', fig.width=6, fig.height=6, cache=TRUE}
+# For local kriging: the number of nearest observations that should be used for a kriging prediction
+# It will speed up computation, otherwise, it'd use all observations.
+nobs <- 100 
+ptm <- proc.time()
+INC.kriged = krige(INC_CNT~1, locations = sub.df, newdata = interp.grd, nmax = nobs, model = INC.sphfit)
+print("Computing Time:")
+proc.time() - ptm
+# spplot(INC.kriged["var1.pred"],col.regions=topo.colors(256),xlab="X Coordinate",ylab="Y Coordinate",main="Kriging Prediction")
+INC.krigedDF <- as.data.frame(INC.kriged)
+names(INC.krigedDF)[1:ncol(INC.krigedDF)] <- c("X_COORD","Y_COORD","Pred","Var")
+levelplot(Pred~X_COORD*Y_COORD, data = INC.krigedDF, col.regions=topo.colors(256),colorkey=list(width=0.75),
+          xlab="X Coordinate",ylab="Y Coordinate",main=list("Kriging Predictions",cex=1))
+```
+
+As Gaussian process is a probabilistic framework, we can also show the one standard errors of interpolations for each location. Except for the corners and the boundaries which lack available data, other locations have very close standard errors.
+
+```{r krige-pred-sd, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center', fig.width=6, fig.height=6, cache=TRUE}
+# standard error/confidence interval plot
+levelplot(sqrt(Var)~X_COORD*Y_COORD, data = INC.krigedDF, col.regions=topo.colors(256),colorkey=list(width=0.75),
+          xlab="X Coordinate",ylab="Y Coordinate",main=list("One standard errors of the kriging predictions",cex=1))
+```

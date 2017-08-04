@@ -1,0 +1,524 @@
+---
+title: "Burglary_DistrictTS_DistrictKriging"
+date: "August 27, 2015"
+output: html_document
+---
+
+```{r load-crimedata,echo=FALSE,message=FALSE,cache=TRUE}
+setwd("/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/BurglaryAnalysis/")
+source("importCrimeData.R")
+filePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/DataPortal/"
+fileName <- "BURGLARY_01_14.csv"
+BurglaryData <- importCrimeData(filePath,fileName)
+row.names(BurglaryData) <- NULL
+```
+
+```{r load-shapefile,echo=FALSE,warning=FALSE,message=FALSE,cache=TRUE}
+library(rgdal)
+shapefilePath.new <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/CPDShapeFiles/new/"
+beat_new.rg <- readOGR(paste0(shapefilePath.new,"cpd_beats"), "cpd_beats")
+district_new.rg <- readOGR(paste0(shapefilePath.new, "cpd_districts"),"cpd_districts")
+# centroids 
+Crd.beat <- coordinates(beat_new.rg)
+Crd.district <- coordinates(district_new.rg)
+```
+
+The beat and district numbers in the data were re-assigned by finding in which new beat/district polygon the point falls and then label that beat/district number. Therefore all violent crime beat and district records have a unified reference which is the new CPD beat/district map.
+
+```{r rearrange-data,echo=FALSE,warning=FALSE,message=FALSE,cache=TRUE}
+## Match old and new beat 
+# Matching the old beat records and the new one by finding which new beat polygon the point falls in
+# and then re-assign that beat number to that crime record. 
+# Therefore all crime beat records have a unified reference which is the new beat map.
+source("DataPolyMatching.R")
+Match1 <- DataMatching2(BurglaryData,beat_new.rg,area="BEAT")
+BurglaryData <- Match1$CrimeData
+Match2 <- DataMatching2(BurglaryData,district_new.rg,area="DISTRICT")
+BurglaryData <- Match2$CrimeData
+
+## Aggregated by "beat" and add 'holiday' attribute
+source("HolidayChart.R")
+BurglaryData.beat_day <- aggregate(INC_CNT~BEAT+DISTRICT+DATEOCC+YEAR+MONTH+DOW,data=BurglaryData, FUN=sum, na.rm=TRUE)
+BurglaryData.beat_day <- BurglaryData.beat_day[order(BurglaryData.beat_day$DATEOCC),]
+BurglaryData.beat_day$DOW <- factor(BurglaryData.beat_day$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+BurglaryData.beat_day$HOLIDAY <- sapply(BurglaryData.beat_day$DATEOCC,FUN=holidays)
+BurglaryData.beat_day$HOLIDAY <- factor(BurglaryData.beat_day$HOLIDAY)
+
+BurglaryData$HOLIDAY <- sapply(BurglaryData$DATEOCC,FUN=holidays)
+BurglaryData$HOLIDAY <- factor(BurglaryData$HOLIDAY)
+```
+
+```{r construct-panel-data,echo=FALSE,warning=FALSE,message=FALSE,cache=TRUE}
+## Create a full panel (of size "number of beats * number of dates") data frame and an corresponding STFDF
+beat_template.spdf <- beat_new.rg
+# remove some useless/redundant attributes
+beat_template.spdf@data$SECTOR <- NULL
+beat_template.spdf@data$BEAT <- NULL
+beat_template.spdf@data$BEAT_NUM <- NULL
+# add an attribute INC_CNT
+beat_template.spdf@data$INC_CNT <- rep(NA,nrow(beat_template.spdf@data))
+
+source("ConstructSTData.R")
+STdata.beat <- ConstructArealSTData(BurglaryData.beat_day,beat_template.spdf,Crd.beat,area="BEAT") 
+BurglaryData_beat_day.stfdf <-STdata.beat$CrimeData.stfdf 
+BurglaryData.beat_day <- STdata.beat$CrimeData 
+
+# Add corresponding district numbers for each beat
+inDistrict <- aggregate(.~BEAT_NUMBE,data=beat_template.spdf@data[,c("DISTRICT","BEAT_NUMBE")],FUN=function(x){x[1]})
+names(inDistrict)[names(inDistrict)=="BEAT_NUMBE"] <- "BEAT"
+inDistrict$DISTRICT <- factor(inDistrict$DISTRICT)
+levels(inDistrict$DISTRICT) <- levels(BurglaryData$DISTRICT)
+
+BurglaryData_beat_day.stfdf@data$DISTRICT <- rep(NA,nrow(BurglaryData_beat_day.stfdf@data))
+for (i in 1:nrow(inDistrict)){
+  BurglaryData.beat_day$DISTRICT[BurglaryData.beat_day$BEAT==inDistrict$BEAT[i]] <- inDistrict$DISTRICT[i]
+  BurglaryData_beat_day.stfdf@data$DISTRICT[BurglaryData_beat_day.stfdf@data$BEAT==inDistrict$BEAT[i]] <- inDistrict$DISTRICT[i]
+}
+```
+
+```{r load-weather-data,echo=FALSE,warning=FALSE,message=FALSE,cache=TRUE}
+## Load weather data
+source("WeatherDataFunctions.R")
+WeatherFilePath <- "/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/ExploratoryAnalysis/WeatherData/"
+startDate="01/01/2001"
+endDate="12/31/2014"
+filename.daily <- paste(WeatherFilePath,'WeatherData_Daily_',as.character(as.Date(startDate, "%m/%d/%Y")),
+                        '_',as.character(as.Date(endDate, "%m/%d/%Y")),'.csv',sep='')
+WeatherData.daily <- read.csv(filename.daily)
+WeatherData.daily$Date <- as.Date(WeatherData.daily$Date)
+WeatherData.daily_diff <- DailyWeatherDiff(WeatherData.daily)
+```
+
+```{r fit-district-trend,echo=FALSE,warning=FALSE,message=FALSE,cache=TRUE}
+## Fit a temporal model which is specified below for every district
+require(MASS)
+require(glmnet)
+require(dummies)
+require(spacetime)
+require(doMC)
+registerDoMC(cores=4)
+
+beatList <- sort(unique(BurglaryData.beat_day$BEAT))
+districtList <- sort(unique(BurglaryData.beat_day$DISTRICT))
+NumBeat <- length(beatList)
+NumDistrict <- length(districtList)
+district_NumBeat <- aggregate(BEAT~DISTRICT,data=BurglaryData.beat_day,FUN=function(x){length(unique(x))})
+names(district_NumBeat) <- c("DISTRICT","NumBeat")
+
+# First 'trendLen' instances work as buffering data
+trendLen <- 730
+BurglaryData.buffer <- BurglaryData.beat_day[1:NumBeat*trendLen,]
+BurglaryData.nonbuffer <- BurglaryData.beat_day[(NumBeat*trendLen+1):nrow(BurglaryData.beat_day),]
+BurglaryData.nonbuffer$TStrend <- rep(NA,nrow(BurglaryData.nonbuffer))
+BurglaryData.nonbuffer$TSdetrendRes <- rep(NA,nrow(BurglaryData.nonbuffer))
+WeatherData.nonbuffer <- WeatherData.daily[(trendLen+1):nrow(WeatherData.daily),]
+WeatherDataDiff.nonbuffer <- WeatherData.daily_diff[(trendLen-1):nrow(WeatherData.daily_diff),] 
+
+## Predict trend and get residuals for each district (beat)
+BurglaryData.district_day <- aggregate(INC_CNT~DISTRICT+DATEOCC+YEAR+MONTH+DOW+HOLIDAY,data=BurglaryData.beat_day, 
+                                       FUN=sum, na.rm=TRUE)
+BurglaryData.district_day <- BurglaryData.district_day[order(BurglaryData.district_day$DATEOCC),]
+BurglaryData.district_day$DOW <- factor(BurglaryData.district_day$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+
+source("TimeSeriesFunction.R")
+for (i in districtList){
+  BurglaryData.district <- subset(BurglaryData.district_day,DISTRICT==i,select=c("DATEOCC","DOW","MONTH","HOLIDAY","INC_CNT"))
+  
+  # Smooth out holiday cases:
+  BurglaryData.district$INC_CNT_s <- SmoothHoliday(BurglaryData.district)
+  
+  Trend <- PredictTrend(BurglaryData.district,trendLen,nlfit="IRLS") 
+  # District trend values are divided by the number of beat in corresponding district to get evenly distributed beat trend estimates
+  idx <- BurglaryData.nonbuffer$DISTRICT==i
+  nbeat <- district_NumBeat$NumBeat[district_NumBeat$DISTRICT==i]
+  BurglaryData.nonbuffer$TStrend[idx] <- rep(Trend, each=nbeat) / nbeat
+  BurglaryData.nonbuffer$TSdetrendRes[idx] <- BurglaryData.nonbuffer$INC_CNT[idx]-BurglaryData.nonbuffer$TStrend[idx]  
+}
+```
+
+The evaluation date starts from 2014-08-01 and ends on 2014-08-04. The time series training uses 12-year data before the corresponding testing date.   
+```{r kriging-setting,echo=FALSE,warning=FALSE,message=FALSE,cache=TRUE}
+library(gstat)
+library(xts)
+library(raster)
+
+# Evaluation periods
+startDate.eval = as.Date("2014-08-01")
+endDate.eval <- as.Date("2014-08-04")
+dateSeq.eval <- seq.Date(startDate.eval,endDate.eval,by=1)
+
+BurglaryData.eval <- subset(BurglaryData.nonbuffer,DATEOCC %in% dateSeq.eval)
+BurglaryData.eval$TSresPred <- rep(NA,nrow(BurglaryData.eval))
+
+# Input arguments for time series regression
+glm <- "gaussian"
+varSet <- c("DOW","weather","weatherdiff")
+standardize <- "minmax"
+Windowing <- FALSE
+nlambda <- 20
+Ntrain <- 365*12
+winSize <- 90
+winNum <- 12
+parallel <- TRUE
+
+# spatial separation distance up to which point pairs are included in semivariance estimates
+# the length of the diagonal of the box spanning the data is divided by a certain number
+cutoff <- 15000
+width <- 500
+vgm.prodsum <- vgmST("productSum",space=vgm(psill=0.2,"Sph",range=3000, nugget=0.02),
+                     time=vgm(psill=0.05,"Sph",range=1,nugget=0.02), sill=0.3, nugget=0.1)
+Nvario <- 365*2
+
+# The spatial interpolation is done over a 'interpx*interpy' regular grid within the city border.
+# spatial interpolation grid
+ncell.x <- 120
+ncell.y <- 160
+X_range <- beat_new.rg@bbox[1,]
+Y_range <- beat_new.rg@bbox[2,]
+grd.full <- expand.grid(list(X_COORD=seq(X_range[1],X_range[2],length.out=ncell.x),
+                             Y_COORD=seq(Y_range[1],Y_range[2],length.out=ncell.y)))
+coordinates(grd.full) = ~X_COORD+Y_COORD # convert to SpatialPoints
+proj4string(grd.full) <- proj4string(beat_new.rg)
+
+grdInCity <- over(grd.full,as(beat_new.rg,"SpatialPolygons"))
+
+grd.beat_s <- grd.full[!is.na(grdInCity)]
+grd.beat_s <- SpatialPixels(grd.beat_s)
+
+krigeST.df <- data.frame(X_COORD=rep(grd.beat_s@coords[,1],length(dateSeq.eval)),
+                         Y_COORD=rep(grd.beat_s@coords[,2],length(dateSeq.eval)),
+                         DATEOCC=rep(dateSeq.eval,each=nrow(grd.beat_s@coords)),
+                         krigePred=rep(NA,nrow(grd.beat_s@coords)*length(dateSeq.eval)))
+```
+
+The time series models were applied to each district. Then uniformly allocate the residuals to each beat, i.e. the temporal model residual of each beat is assumed be the district residual divided by the number of beats in that district.
+
+```{r districtTS-districtKriging,echo=FALSE,warning=FALSE,message=FALSE,cache=TRUE}
+## Predict detrending residuals for each beat (by averaging district residuals)
+# and then do Kriging based on beat-level spatio-temporal (local) variograms of temporal model errors
+
+for (i in 1:length(dateSeq.eval)){
+  # pinpoint the training time range
+  d <- dateSeq.eval[i]
+  startDate.train <- d-Ntrain
+  endDate.train <- d-1
+  dateSeq.train <- seq.Date(startDate.train,endDate.train,by=1)
+  
+  BurglaryData.test <- subset(BurglaryData.nonbuffer,DATEOCC==d)
+  WeatherData.test <- subset(WeatherData.nonbuffer,Date==d)
+  WeatherDataDiff.test <- subset(WeatherDataDiff.nonbuffer,Date==d)
+  
+  if (Windowing){
+    dateWindow <- HistDateWindows(dateSeq.train,d,windowSize=winSize,windowNum=winNum,interval=365.25,dir="backward")
+    BurglaryData.train <- subset(BurglaryData.nonbuffer,DATEOCC %in% dateWindow$histDates)
+    WeatherData.train <- subset(WeatherData.nonbuffer,Date %in% dateWindow$histDates)
+    WeatherDataDiff.train <- subset(WeatherDataDiff.nonbuffer,Date %in% dateWindow$histDates)
+  }
+  else{
+    # use all training data: 
+    BurglaryData.train <- subset(BurglaryData.nonbuffer,DATEOCC %in% dateSeq.train)
+    WeatherData.train <- subset(WeatherData.nonbuffer,Date %in% dateSeq.train)
+    WeatherDataDiff.train <- subset(WeatherDataDiff.nonbuffer,Date %in% dateSeq.train)
+  }
+  
+  BurglaryData.train$TSresPred <- rep(NA,nrow(BurglaryData.train))
+  
+  for (j in districtList){
+    # district 31 has too few samples
+    if (j=="031"){
+      BurglaryData.eval$TSresPred[BurglaryData.eval$DISTRICT==j&BurglaryData.eval$DATEOCC==d] <- 0
+      BurglaryData.train$TSresPred[BurglaryData.eval$DISTRICT==j] <- 0
+      next
+    }
+    
+    #Combine training data of all variables     
+    BurglaryData.train_district <- aggregate(cbind(INC_CNT,TStrend,TSdetrendRes)~DISTRICT+DATEOCC+MONTH+DOW, 
+                                                data=BurglaryData.train, FUN=sum, na.rm=TRUE)
+    BurglaryData.train_district <- BurglaryData.train_district[order(BurglaryData.train_district$DATEOCC),]
+    BurglaryData.train_district$DOW <- factor(BurglaryData.train_district$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+    
+    BurglaryData.test_district <- aggregate(cbind(INC_CNT,TStrend,TSdetrendRes)~DISTRICT+DATEOCC+MONTH+DOW, 
+                                          data=BurglaryData.test, FUN=sum, na.rm=TRUE)
+    BurglaryData.test_district <- BurglaryData.test_district[order(BurglaryData.test_district$DATEOCC),]
+    BurglaryData.test_district$DOW <- factor(BurglaryData.test_district$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+    
+    BurglaryData.train_district <- subset(BurglaryData.train_district,DISTRICT==j,
+                                       select=c("DATEOCC","DOW","MONTH","INC_CNT","TStrend","TSdetrendRes"))
+    BurglaryData.test_district <- subset(BurglaryData.test_district,DISTRICT==j,
+                                      select=c("DATEOCC","DOW","MONTH","INC_CNT","TStrend","TSdetrendRes"))
+    
+    selectData.train <- VariableSet(varSet,BurglaryData.train_district,WeatherData.train,WeatherDataDiff.train,glm)
+    selectData.test <- VariableSet(varSet,BurglaryData.test_district,WeatherData.test,WeatherDataDiff.test,glm)
+    
+    X.train_raw <- selectData.train$X
+    y.train <- selectData.train$y   
+    X.test_raw <- selectData.test$X
+    y.test <- selectData.test$y
+    
+    scaling.train <- Standardization(X.train_raw,X.train_raw,standardize,varSet,glm)    
+    scaling.test <- Standardization(X.train_raw,X.test_raw,standardize,varSet,glm)
+    X.train <- scaling.train$scaledData
+    X.test <- scaling.test$scaledData
+    scalingflag <- scaling.test$flag
+    
+    if (length(unique(y.train))<3){
+      # if there is too less variation in the response, the 'cv.glmnet' will have trouble generating the lambda sequence 
+      y_hat.test <- median(y.train)
+      y_hat.train <- rep(median(y.train),length(y.train))
+    }
+    else{
+      cvfit <- cv.glmnet(as.matrix(X.train),as.vector(y.train),family=glm,standardize=scalingflag,nlambda=nlambda,parallel=parallel)   
+      fit.lasso <- glmnet(as.matrix(X.train),as.vector(y.train),family=glm,lambda=cvfit$lambda.min,standardize=scalingflag)    
+      
+      y_hat.test <- predict(fit.lasso,newx=as.matrix(X.test),type="response")
+      y_hat.train <- predict(fit.lasso,newx=as.matrix(X.train),type="response")     
+    } 
+    
+    idx.eval <- BurglaryData.eval$DISTRICT==j&BurglaryData.eval$DATEOCC==d
+    idx.train <- BurglaryData.train$DISTRICT==j
+    nbeat <- district_NumBeat$NumBeat[district_NumBeat$DISTRICT==j]
+    BurglaryData.eval$TSresPred[idx.eval] <- rep(y_hat.test, each=nbeat) / nbeat
+    BurglaryData.train$TSresPred[idx.train] <- rep(y_hat.train, each=nbeat) / nbeat
+  }
+  
+  BurglaryData.train <- within(BurglaryData.train, TSpred <- TSresPred+TStrend)
+  BurglaryData.train <- within(BurglaryData.train, TSerr <- INC_CNT-TSpred)
+    
+  # temporal grid 
+  grd.beat_t <- xts(1:1,order.by=seq(d,d,by=1))
+  
+  # Loop over each district to estimate local variograms and do Kriging prediction
+  # use only *Nvario* samples to estimate variograms
+  if (nrow(BurglaryData.train)/NumBeat > Nvario){
+    BurglaryData.train <- BurglaryData.train[(nrow(BurglaryData.train)-Nvario*NumBeat+1):nrow(BurglaryData.train),]
+  }
+  
+  # create a global training STFDF then subset it locally in the loop
+  BurglaryData.train_stfdf <- ConstructSTData(BurglaryData.train,beat_template.spdf,Crd.beat,area="BEAT")
+  
+  for (k in districtList){
+    if (k=="031"){
+      grdInDistrict <- over(as(grd.beat_s,"SpatialPoints"),
+                            as(district_new.rg[district_new.rg$DISTRICT=="031",],"SpatialPolygons"))
+      grd.local_beat_s <- grd.beat_s[!is.na(grdInDistrict)]
+      for (m in 1:nrow(grd.local_beat_s@coords)){
+        matchIdx <- with(krigeST.df, DATEOCC==d & X_COORD==grd.local_beat_s@coords[m,1] & Y_COORD==grd.local_beat_s@coords[m,2])
+        krigeST.df$krigePred[matchIdx] <- 0
+      }
+      next
+    }
+    BurglaryData.train_local <- subset(BurglaryData.train,DISTRICT==k)
+
+    BurglaryData.train_local_stfdf <- BurglaryData.train_stfdf[BurglaryData.train_stfdf$DISTRICT==k, ,
+                                                         names(BurglaryData.train_stfdf@data),drop=FALSE] 
+    stVgm.local_beat <- variogramST(TSerr~1,BurglaryData.train_local_stfdf[, ,"TSerr"],cutoff=cutoff,
+                                    width=width,tlags=0:14,assumeRegular=TRUE,progress=FALSE,na.omit=TRUE)
+    # extractPar(vgm.prodsum)
+    # parameter order: space sill, space range, time sill, time range, sill, nugget 
+    vgm.prodsum_fit <- fit.StVariogram(stVgm.local_beat,vgm.prodsum,fit.method=6,method="L-BFGS-B",
+                                       lower=c(0.01,1000,0.01,1,0.05,0.01),upper=c(5,30000,1,14,2,1))
+
+    
+    # local spatial grid (inside a certain distirct)
+    grdInDistrict <- over(as(grd.beat_s,"SpatialPoints"),
+                          as(district_new.rg[district_new.rg$DISTRICT==k,],"SpatialPolygons"))
+    
+    grd.local_beat_s <- grd.beat_s[!is.na(grdInDistrict)]
+    # grd.local_beat_s <- SpatialPixels(grd.local_beat_s)
+    
+    # spatio-temporal grid
+    grd.local_beat_st <- STF(grd.local_beat_s,grd.beat_t,endTime=as.POSIXct(d+1))
+    
+    # Kriging
+    attr(vgm.prodsum_fit, "temporal unit") <- "days"
+
+    # Use only recent 14 days for prediction  
+    predST.local_beat <- krigeST(TSerr~1, data=BurglaryData.train_local_stfdf[,(length(BurglaryData.train_local_stfdf@time)-13)
+                                                                           :length(BurglaryData.train_local_stfdf@time),"TSerr"], 
+                                 newdata=grd.local_beat_st, modelList=vgm.prodsum_fit, computeVar=F, progress=F)
+
+    predST.df <- as.data.frame(predST.local_beat)
+    predST.df$endTime <- NULL
+    predST.df$sp.ID <- NULL
+    predST.df$timedata <- NULL
+    names(predST.df)[1:ncol(predST.df)] <- c("X_COORD","Y_COORD","DATEOCC","krigePred")
+    
+    for (m in 1:nrow(predST.df)){
+      matchIdx <- with(krigeST.df, DATEOCC==d & X_COORD==predST.df$X_COORD[m] & Y_COORD==predST.df$Y_COORD[m])
+      krigeST.df[matchIdx,] <- predST.df[m,]
+    }
+  }
+  
+}
+```
+
+Variogram models were estimated from recent two-year beat-level residual data. For each district, we calculate an empirical variogram. And if a point on the fine regular grid falls into a district, its spatial interpolation will be done through the Kriging using this district's variogram. We use only two year data and consider the time intervals up to 14 days to relieve computation burden. In our experiment, we choose the product-sum model with the spherical model for both temporal and spatial terms. One variogram example and its fitting is shown below.
+```{r vgm-example, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=6, fig.height=4.5, cache=TRUE}
+# show the variogram plot of the last evaluation example
+f <- plot(stVgm.local_beat,vgm.prodsum_fit, all=T, wireframe=T, zlab=NULL, xlab=list("distance", rot=30), 
+          ylab=list("time lag", rot=-35),scales=list(arrows=F,z=list(distance=5)), colorkey=list(width=0.75))
+print(f)
+```
+
+```{r aggrange-result, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# Create a STFDF with full panel (of size "number of beats * number of dates") evaluation data
+BurglaryData.eval <- within(BurglaryData.eval, TSpred <- TSresPred+TStrend)
+BurglaryData.eval <- within(BurglaryData.eval, TSerr <- INC_CNT-TSpred)
+
+BurglaryData.eval_stfdf <- ConstructSTData(BurglaryData.eval,beat_template.spdf,Crd.beat,area="BEAT")
+
+# Map results of form data frame to spatial (pixelized) representations
+beat_template.pred_spdf <- beat_template.spdf
+beat_template.pred_spdf@data$TSpred <- rep(NA,nrow(beat_template.pred_spdf@data))
+beat_template.pred_spdf@data$TSerr <- rep(NA,nrow(beat_template.pred_spdf@data))
+beat_template.pred_spdf@data$krigePred <- rep(NA,nrow(beat_template.pred_spdf@data))
+
+PredResults <- data.frame(matrix(ncol=10, nrow=nrow(krigeST.df)))
+colnames(PredResults) <- c("X_COORD","Y_COORD","DATEOCC","DISTRICT","BEAT","INC_CNT","TSpred","TSerr","krigePred","overlayPred")
+PredResults$DATEOCC <- krigeST.df$DATEOCC
+
+for (i in 1:length(dateSeq.eval)){
+  d <- dateSeq.eval[i]
+  Pred.df <- as.data.frame(BurglaryData.eval_stfdf[,d])
+  Pred.df$DATEOCC <- rep(d,nrow(Pred.df))
+  
+  beatPred.spdf <- beat_template.pred_spdf
+  for (j in beatList){
+    Pred.beat_sub <- subset(Pred.df,BEAT==j)
+    
+    beatPred.spdf@data$INC_CNT[beatPred.spdf@data$BEAT_NUMBE==j] <- Pred.beat_sub$INC_CNT
+    beatPred.spdf@data$TSpred[beatPred.spdf@data$BEAT_NUMBE==j] <- Pred.beat_sub$TSpred
+    beatPred.spdf@data$TSerr[beatPred.spdf@data$BEAT_NUMBE==j] <- Pred.beat_sub$TSerr
+  } 
+    
+  polysample <- over(grd.beat_s,beatPred.spdf)
+  
+  polysample <- subset(cbind(polysample, grd.beat_s@coords),select=-c(OBJECTID))
+  names(polysample)[names(polysample)=="BEAT_NUMBE"] <- "BEAT"
+  
+  PredResults.sub <- subset(krigeST.df, DATEOCC==d)
+  PredResults.sub <- merge(PredResults.sub,polysample,by=c("X_COORD","Y_COORD"),all=TRUE)
+  PredResults.sub$krigePred.y <- NULL                                
+  names(PredResults.sub)[names(PredResults.sub)=="krigePred.x"] <- "krigePred"
+  PredResults.sub$overlayPred <- PredResults.sub$TSpred + PredResults.sub$krigePred
+  
+  PredResults[PredResults$DATEOCC==d,names(PredResults.sub)] <- PredResults.sub
+}
+```
+Here shows an example of time series predictions' and residuals' distribution (last evaluation example).
+
+```{r visualize-TS-result, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=6, fig.height=4.5, cache=TRUE}
+# Plot time series predictions and the corresponding residual spatial distribution (only show the last evaluation example)
+jet.colors <- colorRampPalette(c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000"))
+f1 <- spplot(beatPred.spdf, zcol="TSpred", col.regions=jet.colors(256),colorkey=list(width=0.5),
+             main=list("Predicted beat level crime count",cex=0.75))
+f2 <- spplot(beatPred.spdf, zcol="TSerr", col.regions=jet.colors(256),colorkey=list(width=0.5),
+             main=list("Residual",cex=0.75))
+print(f1, position=c(0, 0, 1/2, 1), more=TRUE)
+print(f2, position=c(1/2, 0, 1, 1))
+```
+Here is the visualization of prediction results.
+```{r visualize-Krige-result, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=8, fig.height=8, cache=TRUE}
+## Visualize prediction results
+# Superimpose the acutal observations
+BurglaryActualPts <- subset(BurglaryData,DATEOCC %in% dateSeq.eval,select=c("DATEOCC","X_COORD","Y_COORD","INC_CNT"))
+
+library(latticeExtra)
+f1 <- levelplot(overlayPred~X_COORD+Y_COORD|DATEOCC, data=PredResults,col.regions=jet.colors(256),
+                colorkey=list(width=0.75),xlab="X Coordinate",ylab="Y Coordinate",as.table=TRUE,
+                main=list("Prediction and Actual Incident Locations",cex=0.75))
+f2 <- xyplot(Y_COORD~X_COORD|DATEOCC, data=BurglaryActualPts, pch=16,col="red",cex=0.3,colorkey=list(width=0.75))
+print(f1+as.layer(f2))
+```
+The evaluation is done through sensitivity(TPR)-like comparison between prediction model,long-term density and short-term density. To illustrate the idea, we demonstrate an example below the *sensitivity* plots: first selecting 10% highest pixels (threshold = 0.9 quantile of image histogram) then count how many actual crime incidents happened in these regions. And we do in this fashion for different threshold quantiles to get the *sensitivity* plot.
+```{r evaluation, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# Evalutation
+# percentage of points in hot regions: raster to polygons 
+# (better than contour method: having closed polygons when some sides hit boundaries)
+# Sensitivity(recall)-like comparison between prediction model,long-term density and short-term density
+library(igraph)
+library(KernSmooth)
+source("EvaluationFunction.R")
+
+r <- raster(ncol=grd.beat_s@grid@cells.dim[1],nrow=grd.beat_s@grid@cells.dim[2],
+            xmn=grd.beat_s@bbox[1,1],xmx=grd.beat_s@bbox[1,2],ymn=grd.beat_s@bbox[2,1],ymx=grd.beat_s@bbox[2,2])
+period.long <- 365
+period.short <- 7
+probset <- seq(0,1,length.out=21)
+TPR.pred <- matrix(NA,nrow=length(dateSeq.eval),ncol=length(probset))
+TPR.long <- matrix(NA,nrow=length(dateSeq.eval),ncol=length(probset))
+TPR.short <- matrix(NA,nrow=length(dateSeq.eval),ncol=length(probset))
+bw <- 1*grd.beat_s@grid@cellsize
+
+for (i in 1:length(dateSeq.eval)){
+  d <- dateSeq.eval[i]
+  
+  PredResults.sub <- subset(PredResults,DATEOCC==d)
+  PredResults.subRaster <- rasterize(PredResults.sub[,c("X_COORD","Y_COORD")], r, 
+                                     PredResults.sub$overlayPred, fun=sum)
+  
+  BurglaryHistPts.long <- subset(BurglaryData,DATEOCC>=d-period.long & DATEOCC<=d-1,select=c("X_COORD","Y_COORD","INC_CNT"))
+  BurglaryHistPts.short <- subset(BurglaryData,DATEOCC>=d-period.short & DATEOCC<=d-1,select=c("X_COORD","Y_COORD","INC_CNT"))
+  
+  KDE.long <- ConstrainedKDE(BurglaryHistPts.long,grd.beat_s,beat_template.spdf,bandwidth=bw,raster=r)
+  KDE.long_df_inPoly <- KDE.long$KDE.df
+  KDE.long_df_inPolyRaster <- KDE.long$KDE.raster
+  
+  KDE.short <- ConstrainedKDE(BurglaryHistPts.short,grd.beat_s,beat_template.spdf,bandwidth=bw,raster=r)
+  KDE.short_df_inPoly <- KDE.short$KDE.df
+  KDE.short_df_inPolyRaster <- KDE.short$KDE.raster
+  
+  BurglaryActualPts.sub <- subset(BurglaryActualPts,DATEOCC==d,select=c("X_COORD","Y_COORD","INC_CNT"))
+  coordinates(BurglaryActualPts.sub) <- c("X_COORD", "Y_COORD") # promote to SpatialPointsDataFrame
+  proj4string(BurglaryActualPts.sub) <- proj4string(beat_template.spdf)
+  
+  for (p in 1:length(probset)){ 
+    Hit.pred <- HitRate(PredResults.sub$overlayPred,PredResults.subRaster,probset[p],BurglaryActualPts.sub)  
+    Hit.long<- HitRate(KDE.long_df_inPoly$VALUE,KDE.long_df_inPolyRaster,probset[p],BurglaryActualPts.sub)
+    Hit.short <- HitRate(KDE.short_df_inPoly$VALUE,KDE.short_df_inPolyRaster,probset[p],BurglaryActualPts.sub)  
+    TPR.pred[i,p] <- Hit.pred$HitRate
+    TPR.long[i,p] <- Hit.long$HitRate
+    TPR.short[i,p] <- Hit.short$HitRate
+  }   
+}
+```
+
+```{r visualize-evaluation, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=8, fig.height=8, cache=TRUE}
+par.default <- par()
+par(mfrow=c(2,2),mar=c(4, 4, 3, 2),oma=c(4,0,1,0),xpd=NA)
+for (i in 1:length(dateSeq.eval)){
+  plot(probset,TPR.pred[i,],type='b',col='red',cex=1,pch=16,lty="solid",
+       xlab="Pixel quantile of hot spots",ylab="Hit rate",main=dateSeq.eval[i],cex.main=0.75)
+  lines(probset,TPR.long[i,],type='b',col='green',cex=1,pch=15,lty="dotted")
+  lines(probset,TPR.short[i,],type='b',col='blue',cex=1,pch=17,lty="dashed")
+}
+mtext("Sensitivity",side=3,cex=1,outer=TRUE)
+par(fig=c(0,1,0,1), oma=c(0,0,0,0), mar=c(0,0,0,0), new=TRUE)
+plot(0, 0, type="n", bty="n", xaxt="n", yaxt="n")
+legend("bottom",legend=c("prediction model","long-term density","short-term density"),
+       col=c("red","green","blue"),pch=c(16,15,17),lty=c("solid","dotted","dashed"),inset = c(0,0),xpd=TRUE)
+```
+
+```{r evaluation-demo, echo=FALSE, message=FALSE, warning=FALSE, fig.align='center',fig.width=6, fig.height=6, cache=TRUE}
+# Display one example
+prob <- 0.9
+Hit.pred <- HitRate(PredResults.sub$overlayPred,PredResults.subRaster,prob,BurglaryActualPts.sub)  
+Hit.long<- HitRate(KDE.long_df_inPoly$VALUE,KDE.long_df_inPolyRaster,prob,BurglaryActualPts.sub)
+Hit.short <- HitRate(KDE.short_df_inPoly$VALUE,KDE.short_df_inPolyRaster,prob,BurglaryActualPts.sub)  
+
+par <- par.default
+plot(PredResults.subRaster,col=jet.colors(256), main="Kriging predition",
+     panel.first=grid(grd.beat_s@grid@cells.dim[2], grd.beat_s@grid@cells.dim[1],col="lightgray", lty="dotted"))
+plot(Hit.pred$inPoly_poly, border="red", lwd=1.2, add=TRUE)
+plot(BurglaryActualPts.sub, pch=16,col="red",cex=0.5,add=TRUE)
+
+plot(KDE.long_df_inPolyRaster,col=jet.colors(256), main="Long-term density predition",
+     panel.first=grid(grd.beat_s@grid@cells.dim[2], grd.beat_s@grid@cells.dim[1],col="lightgray", lty="dotted"))
+plot(Hit.long$inPoly_poly, border="red", lwd=1.2, add=TRUE)
+plot(BurglaryActualPts.sub, pch=16,col="red",cex=0.5,add=TRUE)
+
+plot(KDE.short_df_inPolyRaster,col=jet.colors(256), main="Short-term density prediction",
+     panel.first=grid(grd.beat_s@grid@cells.dim[2], grd.beat_s@grid@cells.dim[1],col="lightgray", lty="dotted"))
+plot(Hit.short$inPoly_poly, border="red", lwd=1.2, add=TRUE)
+plot(BurglaryActualPts.sub, pch=16,col="red",cex=0.5,add=TRUE)
+```
